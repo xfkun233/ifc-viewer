@@ -1,5 +1,9 @@
 # ifc-viewer
 
+## 项目文档
+
+- IFC 开发交接文档：`docs/IFC开发交接文档.md`
+
 This template should help get you started developing with Vue 3 in Vite.
 
 ## Recommended IDE Setup
