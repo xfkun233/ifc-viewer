@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import IfcViewer from '@/components/IfcViewer.vue'
-import FBXPlayer from '@/components/FBXPlayer.vue'
+import FbxSimpleViewer from '@/components/FbxSimpleViewer.vue'
+import FbxFullViewerPage from '@/components/FbxFullViewerPage.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -12,8 +13,17 @@ const router = createRouter({
     },
     {
       path: '/fbx',
-      name: 'FBXPlayer',
-      component: FBXPlayer,
+      redirect: '/fbx/simple',
+    },
+    {
+      path: '/fbx/simple',
+      name: 'FbxSimpleViewer',
+      component: FbxSimpleViewer,
+    },
+    {
+      path: '/fbx/full',
+      name: 'FbxFullViewerPage',
+      component: FbxFullViewerPage,
     },
   ],
 })
