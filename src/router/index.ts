@@ -2,6 +2,8 @@ import { createRouter, createWebHistory } from 'vue-router'
 import IfcViewer from '@/components/IfcViewer.vue'
 import FbxSimpleViewer from '@/components/FbxSimpleViewer.vue'
 import FbxFullViewerPage from '@/components/FbxFullViewerPage.vue'
+import FbxGeoRefPage from '@/components/FbxGeoRefPage.vue'
+import FbxTerrainPlacementPage from '@/components/FbxTerrainPlacementPage.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -24,6 +26,16 @@ const router = createRouter({
       path: '/fbx/full',
       name: 'FbxFullViewerPage',
       component: FbxFullViewerPage,
+    },
+    {
+      path: '/fbx/georef',
+      name: 'FbxGeoRefPage',
+      component: FbxGeoRefPage,
+    },
+    {
+      path: '/fbx/terrain-place',
+      name: 'FbxTerrainPlacementPage',
+      component: FbxTerrainPlacementPage,
     },
   ],
 })

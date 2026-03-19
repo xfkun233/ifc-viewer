@@ -35,7 +35,7 @@ const errorMessage = ref('')
 const fileName = ref('')
 const autoRotateEnabled = ref(false)
 
-const resumeDelayMs = 60_000
+const resumeDelayMs = 10_000
 const autoRotateSpeed = Math.PI / 10
 let resumeTimer: ReturnType<typeof setTimeout> | null = null
 let animationFrameId = 0
@@ -127,6 +127,43 @@ const animateAutoRotate = (timestamp: number) => {
   viewer.SetCamera?.(nextCamera)
 }
 
+const fitModelToWindowCentered = (animated = false) => {
+  const viewer = getInternalViewer()
+  if (!viewer) return
+
+  // Fit depends on the current canvas aspect ratio.
+  embeddedViewer?.Resize()
+
+  const sphere = viewer.GetBoundingSphere?.(() => true)
+  if (!sphere) return
+
+  viewer.SetUpVector?.(OV.Direction.Y, false)
+  viewer.AdjustClippingPlanesToSphere?.(sphere)
+  viewer.FitSphereToWindow?.(sphere, animated)
+
+  // Enforce camera target to the actual bounding box center.
+  const box = viewer.GetBoundingBox?.(() => true)
+  const camera = viewer.GetCamera?.()
+  if (!box || !camera) return
+
+  const centerX = (box.min.x + box.max.x) / 2
+  const centerY = (box.min.y + box.max.y) / 2
+  const centerZ = (box.min.z + box.max.z) / 2
+
+  const deltaX = centerX - camera.center.x
+  const deltaY = centerY - camera.center.y
+  const deltaZ = centerZ - camera.center.z
+
+  const centeredCamera = new OV.Camera(
+    new OV.Coord3D(camera.eye.x + deltaX, camera.eye.y + deltaY, camera.eye.z + deltaZ),
+    new OV.Coord3D(centerX, centerY, centerZ),
+    new OV.Coord3D(camera.up.x, camera.up.y, camera.up.z),
+    camera.fov,
+  )
+
+  viewer.SetCamera?.(centeredCamera)
+}
+
 const createViewer = () => {
   if (!viewerEl.value) return
   destroyViewer()
@@ -145,25 +182,8 @@ const createViewer = () => {
     onModelLoaded: () => {
       isLoading.value = false
       modelLoaded.value = true
-      const viewer = getInternalViewer()
-      if (viewer) {
-        const sphere = viewer.GetBoundingSphere?.(() => true)
-        if (sphere) {
-          viewer.FitSphereToWindow?.(sphere, false)
-
-          // 明确把相机观察中心锁到模型包围球中心，确保首帧和后续旋转都围绕模型中心。
-          const camera = viewer.GetCamera?.()
-          if (camera && sphere.center) {
-            const centeredCamera = new OV.Camera(
-              new OV.Coord3D(camera.eye.x, camera.eye.y, camera.eye.z),
-              new OV.Coord3D(sphere.center.x, sphere.center.y, sphere.center.z),
-              new OV.Coord3D(camera.up.x, camera.up.y, camera.up.z),
-              camera.fov,
-            )
-            viewer.SetCamera?.(centeredCamera)
-          }
-        }
-      }
+      fitModelToWindowCentered(false)
+      requestAnimationFrame(() => fitModelToWindowCentered(false))
 
       applyAutoRotate(true)
     },
