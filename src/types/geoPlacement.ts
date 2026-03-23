@@ -29,6 +29,7 @@ export interface PlacementUnitInfo {
 
 export interface PlacementExportJson {
   model_name: string
+  height?: number
   rotation: RotationAngles
   points: PlacementPoint[]
   unit?: PlacementUnitInfo

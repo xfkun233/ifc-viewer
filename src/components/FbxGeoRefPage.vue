@@ -5,11 +5,11 @@
 
       <section class="block">
         <label class="file-row">
-          <span>建筑 FBX</span>
-          <input type="file" accept=".fbx" @change="onModelFileChange" />
+          <span>导入 FBX（可多选）</span>
+          <input type="file" accept=".fbx" multiple @change="onModelFileChange" />
         </label>
         <label class="file-row">
-          <span>导入 JSON</span>
+          <span>导入当前资产 JSON</span>
           <input type="file" accept=".json" @change="onImportJsonChange" />
         </label>
         <label>
@@ -18,6 +18,30 @@
         </label>
         <div class="hint">当前模型：{{ modelFileName || '未加载' }}</div>
         <div class="hint">距离单位：{{ unitDisplayText }}</div>
+      </section>
+
+      <section class="block">
+        <h3>资产列表（{{ assets.length }}）</h3>
+        <div class="asset-list" v-if="assets.length">
+          <div v-for="asset in assets" :key="asset.id" class="asset-row">
+            <button
+              class="secondary asset-item"
+              :class="{ active: asset.id === activeAssetId }"
+              @click="setActiveAsset(asset.id)"
+            >
+              <span>{{ asset.name }}</span>
+            </button>
+            <button
+              class="secondary visibility-btn"
+              :title="asset.visible ? '隐藏' : '显示'"
+              @click.stop="toggleAssetVisibility(asset.id)"
+            >
+              {{ asset.visible ? '👁️' : '🚫' }}
+            </button>
+          </div>
+        </div>
+        <div class="hint" v-else>尚未导入 FBX 资产</div>
+        <button class="secondary" :disabled="!activeAssetId" @click="removeActiveAsset">移除当前资产</button>
       </section>
 
       <section class="block">
@@ -32,6 +56,10 @@
             <input v-model.number="baseGeo.lon" type="number" step="0.000001" />
           </label>
         </div>
+        <label>
+          <span>高度 height (m)</span>
+          <input v-model.number="baseHeight" type="number" step="0.1" />
+        </label>
       </section>
 
       <section class="block">
@@ -117,7 +145,7 @@
       </section>
 
       <section class="actions">
-        <button @click="exportJson" :disabled="!canExport">导出 JSON</button>
+        <button @click="exportJson" :disabled="!canExport">导出当前资产 JSON</button>
       </section>
 
       <div v-if="errorMessage" class="error">{{ errorMessage }}</div>
@@ -158,7 +186,7 @@ import {
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js'
 import type { GeoCoordinate, PlacementExportJson, PlacementPoint, RotationAngles } from '@/types/geoPlacement'
-import { applyMetersOffsetOnGeo, isGeoCoordinateValid } from '@/utils/geoTransform'
+import { applyMetersOffsetOnGeo, isGeoCoordinateValid, projectGeoToMeters } from '@/utils/geoTransform'
 import { normalizeRotationAngles, rotateLocalDelta, toThreeEuler } from '@/utils/rotationTransform'
 
 interface PickedPoint {
@@ -166,16 +194,37 @@ interface PickedPoint {
   local: [number, number, number]
 }
 
+interface GeoAsset {
+  id: string
+  name: string
+  model: Group
+  baseModelY: number
+  baseModelScale: Vector3
+  baseGeo: GeoCoordinate
+  height: number
+  rotation: RotationAngles
+  pickedPoints: PickedPoint[]
+  geoPointMap: Record<string, [number, number]>
+  fbxUnitScaleFactor: number
+  fbxUnitFromMetadata: boolean
+  manualMeterPerUnit: number | null
+  visible: boolean
+}
+
 const pointIdOptions = ['Point_A_Base', 'Point_B_Corner', 'Point_C_Roof']
 const ROTATION_MIN = -180
 const ROTATION_MAX = 180
+let assetIdSeed = 1
 
 const canvasHost = ref<HTMLElement | null>(null)
 const modelFileName = ref('')
 const errorMessage = ref('')
 const pickTip = ref('请选择点位并点击“拾取”，然后在模型上单击。')
+const assets = ref<GeoAsset[]>([])
+const activeAssetId = ref<string | null>(null)
 
 const baseGeo = reactive<GeoCoordinate>({ lat: 30.12345, lon: 120.54321 })
+const baseHeight = ref(0)
 const rotation = reactive<RotationAngles>({ heading: 0, pitch: 0, roll: 0 })
 
 const activePickId = ref<string>('Point_A_Base')
@@ -192,11 +241,11 @@ let camera: PerspectiveCamera | null = null
 let renderer: WebGLRenderer | null = null
 let controls: OrbitControls | null = null
 let modelRoot: Group | null = null
-let modelObjectUrl = ''
 let animationFrameId = 0
 let resizeObserver: ResizeObserver | null = null
 let interactionElement: HTMLElement | null = null
 let modelRadius = 1
+let isUpdatingUiFromAsset = false
 
 const markerGroup = new Group()
 const hoverGroup = new Group()
@@ -214,6 +263,226 @@ interface VertexCandidate {
 
 let vertexCandidates: VertexCandidate[] = []
 let snappedCandidate: VertexCandidate | null = null
+
+const activeAsset = computed(() => assets.value.find((item) => item.id === activeAssetId.value) ?? null)
+
+const updateUiFromActiveAsset = () => {
+  isUpdatingUiFromAsset = true
+
+  const asset = activeAsset.value
+  if (!asset) {
+    modelFileName.value = ''
+    baseGeo.lat = 30.12345
+    baseGeo.lon = 120.54321
+    baseHeight.value = 0
+    rotation.heading = 0
+    rotation.pitch = 0
+    rotation.roll = 0
+    pickedPoints.value = []
+    fbxUnitScaleFactor.value = 100
+    fbxUnitFromMetadata.value = false
+    manualMeterPerUnit.value = null
+    modelRoot = null
+    clearSnapState()
+    vertexCandidates = []
+    updateMarkers()
+    isUpdatingUiFromAsset = false
+    return
+  }
+
+  modelFileName.value = asset.name
+  baseGeo.lat = asset.baseGeo.lat
+  baseGeo.lon = asset.baseGeo.lon
+  baseHeight.value = asset.height
+  rotation.heading = asset.rotation.heading
+  rotation.pitch = asset.rotation.pitch
+  rotation.roll = asset.rotation.roll
+  pickedPoints.value = asset.pickedPoints.map((p) => ({ id: p.id, local: [...p.local] as [number, number, number] }))
+  fbxUnitScaleFactor.value = asset.fbxUnitScaleFactor
+  fbxUnitFromMetadata.value = asset.fbxUnitFromMetadata
+  manualMeterPerUnit.value = asset.manualMeterPerUnit
+  modelRoot = asset.model
+  clearSnapState()
+  vertexCandidates = []
+  applyModelRotation()
+  isUpdatingUiFromAsset = false
+}
+
+const syncActiveAssetFromUi = () => {
+  const asset = activeAsset.value
+  if (!asset) return
+
+  asset.baseGeo = { lat: baseGeo.lat, lon: baseGeo.lon }
+  asset.geoPointMap.Point_A_Base = [baseGeo.lat, baseGeo.lon]
+  asset.height = Number.isFinite(baseHeight.value) ? baseHeight.value : 0
+  asset.rotation = { heading: rotation.heading, pitch: rotation.pitch, roll: rotation.roll }
+  asset.pickedPoints = pickedPoints.value.map((p) => ({ id: p.id, local: [...p.local] as [number, number, number] }))
+  asset.fbxUnitScaleFactor = fbxUnitScaleFactor.value
+  asset.fbxUnitFromMetadata = fbxUnitFromMetadata.value
+  asset.manualMeterPerUnit = manualMeterPerUnit.value
+}
+
+const getMeterPerUnitForAsset = (asset: GeoAsset) => {
+  if (Number.isFinite(asset.manualMeterPerUnit) && (asset.manualMeterPerUnit as number) > 0) {
+    return asset.manualMeterPerUnit as number
+  }
+
+  if (Number.isFinite(asset.fbxUnitScaleFactor) && asset.fbxUnitScaleFactor > 0) {
+    return asset.fbxUnitScaleFactor / 100
+  }
+
+  return 1
+}
+
+const getAssetGeoPoint = (asset: GeoAsset, id: string): GeoCoordinate | null => {
+  const value = asset.geoPointMap[id]
+  if (!value) return null
+  const [lat, lon] = value
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
+  return { lat, lon }
+}
+
+const getAssetPointALocal = (asset: GeoAsset) => {
+  const pointA = asset.pickedPoints.find((p) => p.id === 'Point_A_Base')
+  if (!pointA) return null
+  return new Vector3(pointA.local[0], pointA.local[1], pointA.local[2])
+}
+
+const getAssetAbsoluteAnchorGeo = (asset: GeoAsset): GeoCoordinate | null => {
+  return getAssetGeoPoint(asset, 'Point_A_Base')
+}
+
+const getAssetHeadingAndScaleFromGeoPoints = (asset: GeoAsset) => {
+  const pointA = asset.pickedPoints.find((p) => p.id === 'Point_A_Base')
+  const pointAGeo = getAssetGeoPoint(asset, 'Point_A_Base')
+  if (!pointA || !pointAGeo) return null
+
+  const secondary = asset.pickedPoints.find((p) => {
+    if (p.id === 'Point_A_Base') return false
+    return Boolean(getAssetGeoPoint(asset, p.id))
+  })
+  if (!secondary) return null
+
+  const secondaryGeo = getAssetGeoPoint(asset, secondary.id)
+  if (!secondaryGeo) return null
+
+  const localDx = secondary.local[0] - pointA.local[0]
+  const localDz = secondary.local[2] - pointA.local[2]
+  const localDist = Math.hypot(localDx, localDz)
+  if (!Number.isFinite(localDist) || localDist < 1e-6) return null
+
+  const aMeters = projectGeoToMeters(pointAGeo)
+  const bMeters = projectGeoToMeters(secondaryGeo)
+  const worldDx = bMeters.x - aMeters.x
+  const worldDz = bMeters.y - aMeters.y
+  const worldDist = Math.hypot(worldDx, worldDz)
+  if (!Number.isFinite(worldDist) || worldDist < 1e-6) return null
+
+  const headingRad = Math.atan2(worldDz, worldDx) - Math.atan2(localDz, localDx)
+  const meterPerUnit = worldDist / localDist
+  return { headingRad, meterPerUnit }
+}
+
+const applyAssetsSpatialAlignment = () => {
+  if (!assets.value.length) return
+
+  const absoluteAnchorAsset = assets.value.find((asset) => getAssetAbsoluteAnchorGeo(asset))
+  const anchorGeo = absoluteAnchorAsset ? getAssetAbsoluteAnchorGeo(absoluteAnchorAsset) : assets.value[0]?.baseGeo
+  if (!anchorGeo) return
+  const anchorMeters = projectGeoToMeters(anchorGeo)
+  const normalizedHeights = assets.value.map((asset) => (Number.isFinite(asset.height) ? asset.height : 0))
+  const minHeight = Math.min(...normalizedHeights)
+
+  assets.value.forEach((asset) => {
+    const fromGeo = getAssetHeadingAndScaleFromGeoPoints(asset)
+    const meterPerUnit = fromGeo?.meterPerUnit ?? getMeterPerUnitForAsset(asset)
+    asset.model.scale.copy(asset.baseModelScale).multiplyScalar(meterPerUnit)
+
+    const euler = toThreeEuler(asset.rotation)
+    if (fromGeo) {
+      euler.y = fromGeo.headingRad
+    }
+    asset.model.rotation.copy(euler)
+
+    const assetAnchorGeo = getAssetAbsoluteAnchorGeo(asset) ?? asset.baseGeo
+    const meters = projectGeoToMeters(assetAnchorGeo)
+    const targetX = meters.x - anchorMeters.x
+    const targetZ = meters.y - anchorMeters.y
+    const normalizedHeight = Number.isFinite(asset.height) ? asset.height : 0
+    const targetY = asset.baseModelY + (normalizedHeight - minHeight)
+
+    const pointALocal = getAssetPointALocal(asset)
+    if (!pointALocal) {
+      asset.model.position.set(targetX, targetY, targetZ)
+      asset.model.updateMatrixWorld(true)
+      return
+    }
+
+    const rotatedPointAOffset = pointALocal.multiply(asset.model.scale).applyEuler(asset.model.rotation)
+    asset.model.position.set(
+      targetX - rotatedPointAOffset.x,
+      targetY - rotatedPointAOffset.y,
+      targetZ - rotatedPointAOffset.z,
+    )
+    asset.model.updateMatrixWorld(true)
+  })
+
+  refreshVertexWorldPositions()
+  updateMarkers()
+}
+
+const setActiveAsset = (id: string) => {
+  if (activeAssetId.value === id) {
+    updateUiFromActiveAsset()
+    fitModel()
+    updateMarkers()
+    return
+  }
+  syncActiveAssetFromUi()
+  activeAssetId.value = id
+  updateUiFromActiveAsset()
+  fitModel()
+  updateMarkers()
+}
+
+const toggleAssetVisibility = (id: string) => {
+  const asset = assets.value.find((item) => item.id === id)
+  if (!asset) return
+  asset.visible = !asset.visible
+  asset.model.visible = asset.visible
+}
+
+const removeAssetGroup = (group: Group) => {
+  if (!scene) return
+  scene.remove(group)
+  group.traverse((obj) => {
+    const mesh = obj as Mesh
+    if (mesh.geometry) {
+      mesh.geometry.dispose?.()
+    }
+    const material = mesh.material
+    if (Array.isArray(material)) {
+      material.forEach((m) => m.dispose?.())
+    } else {
+      material?.dispose?.()
+    }
+  })
+}
+
+const removeActiveAsset = () => {
+  if (!activeAsset.value) return
+  const removingId = activeAsset.value.id
+  removeAssetGroup(activeAsset.value.model)
+  assets.value = assets.value.filter((item) => item.id !== removingId)
+  applyAssetsSpatialAlignment()
+
+  const next = assets.value[assets.value.length - 1]
+  activeAssetId.value = next ? next.id : null
+  updateUiFromActiveAsset()
+  fitModel()
+  updateMarkers()
+  errorMessage.value = ''
+}
 
 const formatNumber = (value: number, digits = 3) => {
   if (!Number.isFinite(value)) return '--'
@@ -263,17 +532,14 @@ const formatDistanceToBase = (local: [number, number, number]) => {
   return formatNumber(distance, 3)
 }
 
-const updateUnitScaleFromModel = (group: Group) => {
+const readUnitScaleFromModel = (group: Group) => {
   const raw = (group.userData as { unitScaleFactor?: unknown })?.unitScaleFactor
   const value = typeof raw === 'number' ? raw : Number(raw)
   if (Number.isFinite(value) && value > 0) {
-    fbxUnitScaleFactor.value = value
-    fbxUnitFromMetadata.value = true
-    return
+    return { unitScaleFactor: value, unitFromMetadata: true }
   }
 
-  fbxUnitScaleFactor.value = 100
-  fbxUnitFromMetadata.value = false
+  return { unitScaleFactor: 100, unitFromMetadata: false }
 }
 
 const normalizeRotationInputs = () => {
@@ -281,6 +547,7 @@ const normalizeRotationInputs = () => {
   rotation.heading = normalized.heading
   rotation.pitch = normalized.pitch
   rotation.roll = normalized.roll
+  syncActiveAssetFromUi()
 }
 
 const pointAModel = computed(() => pickedPoints.value.find((p) => p.id === 'Point_A_Base') ?? null)
@@ -388,45 +655,8 @@ const refreshVertexWorldPositions = () => {
   }
 }
 
-const rebuildVertexCandidates = () => {
-  if (!modelRoot) return
-
-  const unique = new Set<string>()
-  const collected: VertexCandidate[] = []
-  const modelLocal = new Vector3()
-  const world = new Vector3()
-  const maxVertexCount = 240_000
-
-  modelRoot.updateMatrixWorld(true)
-  modelRoot.traverse((obj) => {
-    const mesh = obj as Mesh
-    const position = mesh.geometry?.getAttribute?.('position')
-    if (!position || !mesh.geometry) return
-
-    const stride = Math.max(1, Math.floor(position.count / maxVertexCount))
-    for (let i = 0; i < position.count; i += stride) {
-      world.fromBufferAttribute(position, i)
-      mesh.localToWorld(world)
-      modelLocal.copy(world)
-      modelRoot?.worldToLocal(modelLocal)
-
-      const key = `${Math.round(modelLocal.x * 1000)}_${Math.round(modelLocal.y * 1000)}_${Math.round(modelLocal.z * 1000)}`
-      if (unique.has(key)) continue
-      unique.add(key)
-
-      collected.push({
-        modelLocal: modelLocal.clone(),
-        world: world.clone(),
-      })
-    }
-  })
-
-  vertexCandidates = collected
-  refreshVertexWorldPositions()
-}
-
 const updateSnappedVertex = (event: { clientX: number; clientY: number }) => {
-  if (!pendingPickId.value || !interactionElement || !camera || !modelRoot || !vertexCandidates.length) {
+  if (!pendingPickId.value || !interactionElement || !camera || !modelRoot) {
     clearSnapState()
     return
   }
@@ -439,37 +669,68 @@ const updateSnappedVertex = (event: { clientX: number; clientY: number }) => {
 
   raycaster.setFromCamera(pointer, camera)
 
-  const maxSnapPixels = 18
-  let bestCandidate: VertexCandidate | null = null
-  let bestScreenX = 0
-  let bestScreenY = 0
-  let bestScore = Number.POSITIVE_INFINITY
-  const projected = new Vector3()
-
-  for (const candidate of vertexCandidates) {
-    projected.copy(candidate.world).project(camera)
-    if (projected.z < -1 || projected.z > 1) continue
-
-    const sx = (projected.x * 0.5 + 0.5) * rect.width
-    const sy = (-projected.y * 0.5 + 0.5) * rect.height
-    const screenDistance = Math.hypot(localX - sx, localY - sy)
-    if (screenDistance > maxSnapPixels) continue
-
-    const rayDistance = raycaster.ray.distanceToPoint(candidate.world)
-    const score = screenDistance * 0.75 + rayDistance * 25
-
-    if (score < bestScore) {
-      bestScore = score
-      bestCandidate = candidate
-      bestScreenX = sx
-      bestScreenY = sy
-    }
-  }
-
-  if (!bestCandidate) {
+  const hits = raycaster.intersectObject(modelRoot, true)
+  if (!hits.length) {
     clearSnapState()
     return
   }
+
+  let bestVertexWorld: Vector3 | null = null
+  let bestVertexToHitDistance = Number.POSITIVE_INFINITY
+
+  for (const hit of hits) {
+    const mesh = hit.object as Mesh
+    const face = hit.face
+    const position = mesh.geometry?.getAttribute?.('position')
+    if (!face || !position) continue
+
+    const va = new Vector3().fromBufferAttribute(position, face.a)
+    const vb = new Vector3().fromBufferAttribute(position, face.b)
+    const vc = new Vector3().fromBufferAttribute(position, face.c)
+
+    mesh.localToWorld(va)
+    mesh.localToWorld(vb)
+    mesh.localToWorld(vc)
+
+    const da = va.distanceToSquared(hit.point)
+    if (da < bestVertexToHitDistance) {
+      bestVertexToHitDistance = da
+      bestVertexWorld = va.clone()
+    }
+
+    const db = vb.distanceToSquared(hit.point)
+    if (db < bestVertexToHitDistance) {
+      bestVertexToHitDistance = db
+      bestVertexWorld = vb.clone()
+    }
+
+    const dc = vc.distanceToSquared(hit.point)
+    if (dc < bestVertexToHitDistance) {
+      bestVertexToHitDistance = dc
+      bestVertexWorld = vc.clone()
+    }
+
+    if (bestVertexWorld) {
+      break
+    }
+  }
+
+  if (!bestVertexWorld) {
+    clearSnapState()
+    return
+  }
+
+  const localHit = bestVertexWorld.clone()
+  modelRoot.worldToLocal(localHit)
+
+  const bestCandidate: VertexCandidate = {
+    modelLocal: localHit,
+    world: bestVertexWorld,
+  }
+
+  const projected = bestVertexWorld.clone().project(camera)
+  const bestScreenX = (projected.x * 0.5 + 0.5) * rect.width
+  const bestScreenY = (-projected.y * 0.5 + 0.5) * rect.height
 
   snappedCandidate = bestCandidate
   hoverGroup.visible = true
@@ -505,8 +766,7 @@ const fitModel = () => {
 const applyModelRotation = () => {
   if (!modelRoot) return
   modelRoot.rotation.copy(toThreeEuler(rotation))
-  refreshVertexWorldPositions()
-  updateMarkers()
+  applyAssetsSpatialAlignment()
 }
 
 const renderLoop = () => {
@@ -517,21 +777,10 @@ const renderLoop = () => {
   }
 }
 
-const disposeModel = () => {
-  if (!modelRoot || !scene) return
-  scene.remove(modelRoot)
-  modelRoot.traverse((obj) => {
-    const mesh = obj as Mesh
-    if (mesh.geometry) {
-      mesh.geometry.dispose?.()
-    }
-    const material = mesh.material
-    if (Array.isArray(material)) {
-      material.forEach((m) => m.dispose?.())
-    } else {
-      material?.dispose?.()
-    }
-  })
+const disposeAllAssets = () => {
+  assets.value.forEach((asset) => removeAssetGroup(asset.model))
+  assets.value = []
+  activeAssetId.value = null
   modelRoot = null
   modelRadius = 1
 }
@@ -558,60 +807,70 @@ const loadModelFromFile = (file: File) => {
   if (!scene) return
 
   errorMessage.value = ''
-  modelFileName.value = file.name
-  pickedPoints.value = []
-  fbxUnitScaleFactor.value = 100
-  fbxUnitFromMetadata.value = false
-  updateMarkers()
-
-  disposeModel()
-  if (modelObjectUrl) {
-    URL.revokeObjectURL(modelObjectUrl)
-    modelObjectUrl = ''
-  }
 
   const loader = new FBXLoader()
-  modelObjectUrl = URL.createObjectURL(file)
+  const objectUrl = URL.createObjectURL(file)
 
   loader.load(
-    modelObjectUrl,
+    objectUrl,
     (group) => {
       if (!scene) return
       group.name = file.name
-      updateUnitScaleFromModel(group)
       applyOvLikeDoubleSide(group)
-      modelRoot = group
-      applyModelRotation()
       scene.add(group)
-      rebuildVertexCandidates()
-      clearSnapState()
+
+      const unit = readUnitScaleFromModel(group)
+      const asset: GeoAsset = {
+        id: `asset-${assetIdSeed++}`,
+        name: file.name,
+        model: group,
+        baseModelY: group.position.y,
+        baseModelScale: group.scale.clone(),
+        baseGeo: { lat: 30.12345, lon: 120.54321 },
+        height: 0,
+        rotation: { heading: 0, pitch: 0, roll: 0 },
+        pickedPoints: [],
+        geoPointMap: {},
+        fbxUnitScaleFactor: unit.unitScaleFactor,
+        fbxUnitFromMetadata: unit.unitFromMetadata,
+        manualMeterPerUnit: null,
+        visible: true,
+      }
+
+      syncActiveAssetFromUi()
+      assets.value.push(asset)
+      applyAssetsSpatialAlignment()
+      activeAssetId.value = asset.id
+      updateUiFromActiveAsset()
       fitModel()
-      URL.revokeObjectURL(modelObjectUrl)
-      modelObjectUrl = ''
+      updateMarkers()
+
+      URL.revokeObjectURL(objectUrl)
     },
     undefined,
     () => {
       errorMessage.value = 'FBX 加载失败，请检查文件是否有效。'
+      URL.revokeObjectURL(objectUrl)
     },
   )
 }
 
 const onModelFileChange = (event: Event) => {
   const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (file) {
-    loadModelFromFile(file)
+  const files = Array.from(input.files ?? [])
+  if (files.length) {
+    files.forEach((file) => loadModelFromFile(file))
   }
   input.value = ''
 }
 
 const startPick = () => {
-  if (!modelRoot) {
-    errorMessage.value = '请先加载建筑 FBX。'
+  if (!activeAsset.value) {
+    errorMessage.value = '请先导入至少一个 FBX 资产。'
     return
   }
-  if (!vertexCandidates.length) {
-    errorMessage.value = '当前模型没有可吸附顶点，无法拾取。'
+  if (!modelRoot) {
+    errorMessage.value = '当前没有可拾取的激活资产。'
     return
   }
   pendingPickId.value = activePickId.value
@@ -625,14 +884,36 @@ const upsertPoint = (id: string, local: [number, number, number]) => {
   } else {
     pickedPoints.value[index] = { id, local }
   }
+  const asset = activeAsset.value
+  if (asset && id !== 'Point_A_Base') {
+    delete asset.geoPointMap[id]
+  }
+  syncActiveAssetFromUi()
+  applyAssetsSpatialAlignment()
 }
 
 const removePoint = (id: string) => {
   pickedPoints.value = pickedPoints.value.filter((p) => p.id !== id)
+  const asset = activeAsset.value
+  if (asset) {
+    delete asset.geoPointMap[id]
+  }
+  syncActiveAssetFromUi()
+  applyAssetsSpatialAlignment()
   updateMarkers()
 }
 
-const onCanvasPointerDown = (event: { clientX: number; clientY: number }) => {
+const onCanvasPointerDown = (event: PointerEvent) => {
+  if (!pendingPickId.value) return
+
+  if (event.button === 2) {
+    pendingPickId.value = null
+    clearSnapState()
+    pickTip.value = '已取消当前拾取。'
+    return
+  }
+
+  if (event.button !== 0) return
   if (!pendingPickId.value || !modelRoot || !interactionElement || !camera) return
   updateSnappedVertex(event)
 
@@ -681,6 +962,13 @@ const onCanvasPointerDown = (event: { clientX: number; clientY: number }) => {
   })
   clearSnapState()
   updateMarkers()
+  syncActiveAssetFromUi()
+}
+
+const onCanvasContextMenu = (event: MouseEvent) => {
+  if (pendingPickId.value) {
+    event.preventDefault()
+  }
 }
 
 const onCanvasPointerMove = (event: PointerEvent) => {
@@ -692,6 +980,11 @@ const onCanvasPointerLeave = () => {
 }
 
 const exportJson = () => {
+  if (!activeAsset.value) {
+    errorMessage.value = '请先选择一个资产再导出 JSON。'
+    return
+  }
+
   if (!canExport.value) {
     errorMessage.value = '导出条件不足：请确认模型、Point_A 与经纬度输入。'
     return
@@ -706,6 +999,7 @@ const exportJson = () => {
 
   const json: PlacementExportJson = {
     model_name: modelFileName.value,
+    height: Number.isFinite(baseHeight.value) ? baseHeight.value : 0,
     rotation: normalizeRotationAngles(rotation),
     points: calculatedPoints.value,
     unit: {
@@ -727,6 +1021,13 @@ const exportJson = () => {
 }
 
 const onImportJsonChange = async (event: Event) => {
+  if (!activeAsset.value) {
+    errorMessage.value = '请先选择一个资产，再导入 JSON。'
+    const input = event.target as HTMLInputElement
+    input.value = ''
+    return
+  }
+
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
@@ -747,6 +1048,8 @@ const onImportJsonChange = async (event: Event) => {
     rotation.heading = parsed.rotation.heading
     rotation.pitch = parsed.rotation.pitch
     rotation.roll = parsed.rotation.roll
+    const importedHeight = parsed.height
+    baseHeight.value = typeof importedHeight === 'number' && Number.isFinite(importedHeight) ? importedHeight : 0
 
     if (parsed.unit && Number.isFinite(parsed.unit.meter_per_unit) && parsed.unit.meter_per_unit > 0) {
       manualMeterPerUnit.value = parsed.unit.meter_per_unit
@@ -759,6 +1062,20 @@ const onImportJsonChange = async (event: Event) => {
       id: p.id,
       local: [p.local[0], p.local[1], p.local[2]],
     }))
+
+    const asset = activeAsset.value
+    if (asset) {
+      const nextGeoPointMap: Record<string, [number, number]> = {}
+      parsed.points.forEach((p) => {
+        if (Number.isFinite(p.geo[0]) && Number.isFinite(p.geo[1])) {
+          nextGeoPointMap[p.id] = [p.geo[0], p.geo[1]]
+        }
+      })
+      asset.geoPointMap = nextGeoPointMap
+    }
+
+    syncActiveAssetFromUi()
+    applyAssetsSpatialAlignment()
     updateMarkers()
     applyModelRotation()
     errorMessage.value = ''
@@ -772,9 +1089,32 @@ const onImportJsonChange = async (event: Event) => {
 watch(
   () => ({ ...rotation }),
   () => {
+    if (isUpdatingUiFromAsset) return
+    syncActiveAssetFromUi()
     applyModelRotation()
   },
 )
+
+watch(
+  () => [baseGeo.lat, baseGeo.lon],
+  () => {
+    if (isUpdatingUiFromAsset) return
+    syncActiveAssetFromUi()
+    applyAssetsSpatialAlignment()
+  },
+)
+
+watch(baseHeight, () => {
+  if (isUpdatingUiFromAsset) return
+  syncActiveAssetFromUi()
+  applyAssetsSpatialAlignment()
+})
+
+watch(manualMeterPerUnit, () => {
+  if (isUpdatingUiFromAsset) return
+  syncActiveAssetFromUi()
+  applyAssetsSpatialAlignment()
+})
 
 onMounted(() => {
   if (!canvasHost.value) return
@@ -822,7 +1162,7 @@ onMounted(() => {
 
   interactionElement.addEventListener('pointermove', onCanvasPointerMove)
   interactionElement.addEventListener('pointerdown', onCanvasPointerDown)
-  interactionElement.addEventListener('click', onCanvasPointerDown)
+  interactionElement.addEventListener('contextmenu', onCanvasContextMenu)
   interactionElement.addEventListener('pointerleave', onCanvasPointerLeave)
   renderLoop()
 })
@@ -833,19 +1173,14 @@ onUnmounted(() => {
   if (interactionElement) {
     interactionElement.removeEventListener('pointermove', onCanvasPointerMove)
     interactionElement.removeEventListener('pointerdown', onCanvasPointerDown)
-    interactionElement.removeEventListener('click', onCanvasPointerDown)
+    interactionElement.removeEventListener('contextmenu', onCanvasContextMenu)
     interactionElement.removeEventListener('pointerleave', onCanvasPointerLeave)
     interactionElement = null
   }
 
   resizeObserver?.disconnect()
 
-  if (modelObjectUrl) {
-    URL.revokeObjectURL(modelObjectUrl)
-    modelObjectUrl = ''
-  }
-
-  disposeModel()
+  disposeAllAssets()
   markerGroup.clear()
   hoverGroup.clear()
   vertexCandidates = []
@@ -964,6 +1299,38 @@ button:disabled {
 
 .file-row {
   margin-bottom: 8px;
+}
+
+.asset-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.asset-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.asset-item {
+  text-align: left;
+}
+
+.asset-item.active {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #fff;
+}
+
+.visibility-btn {
+  min-width: 36px;
+  padding: 8px 6px;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .pick-row {
