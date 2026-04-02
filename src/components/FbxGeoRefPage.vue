@@ -24,18 +24,12 @@
         <h3>资产列表（{{ assets.length }}）</h3>
         <div class="asset-list" v-if="assets.length">
           <div v-for="asset in assets" :key="asset.id" class="asset-row">
-            <button
-              class="secondary asset-item"
-              :class="{ active: asset.id === activeAssetId }"
-              @click="setActiveAsset(asset.id)"
-            >
+            <button class="secondary asset-item" :class="{ active: asset.id === activeAssetId }"
+              @click="setActiveAsset(asset.id)">
               <span>{{ asset.name }}</span>
             </button>
-            <button
-              class="secondary visibility-btn"
-              :title="asset.visible ? '隐藏' : '显示'"
-              @click.stop="toggleAssetVisibility(asset.id)"
-            >
+            <button class="secondary visibility-btn" :title="asset.visible ? '隐藏' : '显示'"
+              @click.stop="toggleAssetVisibility(asset.id)">
               {{ asset.visible ? '👁️' : '🚫' }}
             </button>
           </div>
@@ -67,39 +61,18 @@
         <div class="grid3">
           <label>
             <span>Heading</span>
-            <input
-              v-model.number="rotation.heading"
-              type="number"
-              step="0.1"
-              :min="ROTATION_MIN"
-              :max="ROTATION_MAX"
-              @blur="normalizeRotationInputs"
-              @change="normalizeRotationInputs"
-            />
+            <input v-model.number="rotation.heading" type="number" step="0.1" :min="ROTATION_MIN" :max="ROTATION_MAX"
+              @blur="normalizeRotationInputs" @change="normalizeRotationInputs" />
           </label>
           <label>
             <span>Pitch</span>
-            <input
-              v-model.number="rotation.pitch"
-              type="number"
-              step="0.1"
-              :min="ROTATION_MIN"
-              :max="ROTATION_MAX"
-              @blur="normalizeRotationInputs"
-              @change="normalizeRotationInputs"
-            />
+            <input v-model.number="rotation.pitch" type="number" step="0.1" :min="ROTATION_MIN" :max="ROTATION_MAX"
+              @blur="normalizeRotationInputs" @change="normalizeRotationInputs" />
           </label>
           <label>
             <span>Roll</span>
-            <input
-              v-model.number="rotation.roll"
-              type="number"
-              step="0.1"
-              :min="ROTATION_MIN"
-              :max="ROTATION_MAX"
-              @blur="normalizeRotationInputs"
-              @change="normalizeRotationInputs"
-            />
+            <input v-model.number="rotation.roll" type="number" step="0.1" :min="ROTATION_MIN" :max="ROTATION_MAX"
+              @blur="normalizeRotationInputs" @change="normalizeRotationInputs" />
           </label>
         </div>
         <div class="hint">范围：{{ ROTATION_MIN }}° 到 {{ ROTATION_MAX }}°（超出会自动折返归一化）</div>
@@ -152,11 +125,8 @@
     </aside>
 
     <main ref="canvasHost" class="viewport" :class="{ 'is-picking': Boolean(pendingPickId) }">
-      <div
-        v-if="showSnapCursor"
-        class="snap-cursor"
-        :style="{ left: `${snapCursor.x}px`, top: `${snapCursor.y}px` }"
-      ></div>
+      <div v-if="showSnapCursor" class="snap-cursor" :style="{ left: `${snapCursor.x}px`, top: `${snapCursor.y}px` }">
+      </div>
     </main>
   </div>
 </template>
@@ -261,7 +231,6 @@ interface VertexCandidate {
   world: Vector3
 }
 
-let vertexCandidates: VertexCandidate[] = []
 let snappedCandidate: VertexCandidate | null = null
 
 const activeAsset = computed(() => assets.value.find((item) => item.id === activeAssetId.value) ?? null)
@@ -284,7 +253,6 @@ const updateUiFromActiveAsset = () => {
     manualMeterPerUnit.value = null
     modelRoot = null
     clearSnapState()
-    vertexCandidates = []
     updateMarkers()
     isUpdatingUiFromAsset = false
     return
@@ -303,7 +271,6 @@ const updateUiFromActiveAsset = () => {
   manualMeterPerUnit.value = asset.manualMeterPerUnit
   modelRoot = asset.model
   clearSnapState()
-  vertexCandidates = []
   applyModelRotation()
   isUpdatingUiFromAsset = false
 }
@@ -427,7 +394,6 @@ const applyAssetsSpatialAlignment = () => {
     asset.model.updateMatrixWorld(true)
   })
 
-  refreshVertexWorldPositions()
   updateMarkers()
 }
 
@@ -452,6 +418,17 @@ const toggleAssetVisibility = (id: string) => {
   asset.model.visible = asset.visible
 }
 
+const disposeMaterial = (material: any) => {
+  if (!material) return
+  for (const key in material) {
+    const value = material[key]
+    if (value && typeof value === 'object' && value.isTexture) {
+      value.dispose()
+    }
+  }
+  material.dispose?.()
+}
+
 const removeAssetGroup = (group: Group) => {
   if (!scene) return
   scene.remove(group)
@@ -462,9 +439,9 @@ const removeAssetGroup = (group: Group) => {
     }
     const material = mesh.material
     if (Array.isArray(material)) {
-      material.forEach((m) => m.dispose?.())
+      material.forEach((m) => disposeMaterial(m))
     } else {
-      material?.dispose?.()
+      disposeMaterial(material)
     }
   })
 }
@@ -644,15 +621,6 @@ const clearSnapState = () => {
   snappedCandidate = null
   showSnapCursor.value = false
   hoverGroup.visible = false
-}
-
-const refreshVertexWorldPositions = () => {
-  if (!modelRoot) return
-  modelRoot.updateMatrixWorld(true)
-  for (const candidate of vertexCandidates) {
-    candidate.world.copy(candidate.modelLocal)
-    modelRoot.localToWorld(candidate.world)
-  }
 }
 
 const updateSnappedVertex = (event: { clientX: number; clientY: number }) => {
@@ -1183,7 +1151,6 @@ onUnmounted(() => {
   disposeAllAssets()
   markerGroup.clear()
   hoverGroup.clear()
-  vertexCandidates = []
   clearSnapState()
 
   controls?.dispose()
@@ -1428,6 +1395,7 @@ button:disabled {
 }
 
 @media (max-width: 640px) {
+
   .grid2,
   .grid3,
   .pick-row {
