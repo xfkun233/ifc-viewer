@@ -1,0 +1,113 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum ModelSyncStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum PropertySource {
+  NATIVE
+  CUSTOM
+}
+
+enum PropertyValueType {
+  STRING
+  LABEL
+  REAL
+  INTEGER
+  BOOLEAN
+}
+
+model IfcModel {
+  id                    String               @id @default(cuid())
+  originalFileName      String
+  storedFileName        String               @unique
+  mimeType              String
+  fileSize              Int
+  fileHash              String
+  sourceFingerprint     String
+  syncStatus            ModelSyncStatus      @default(PENDING)
+  syncQueuedAt          DateTime?
+  syncError             String?              @db.Text
+  syncProcessedElements Int                  @default(0)
+  totalElements         Int                  @default(0)
+  totalProperties       Int                  @default(0)
+  syncStartedAt         DateTime?
+  syncCompletedAt       DateTime?
+  lastAccessedAt        DateTime?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+  elements              IfcElement[]
+  properties            IfcElementProperty[]
+  annotations           IfcAnnotation[]
+
+  @@index([createdAt])
+  @@index([fileHash])
+  @@index([sourceFingerprint])
+  @@index([syncStatus, syncQueuedAt])
+}
+
+model IfcElement {
+  id              String   @id @default(cuid())
+  modelId         String
+  expressId       Int
+  globalId        String?
+  entityType      String?
+  name            String?
+  objectType      String?
+  predefinedType  String?
+  attributesJson  Json?
+  rawDataJson     Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  model           IfcModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, expressId])
+  @@index([modelId, expressId])
+}
+
+model IfcElementProperty {
+  id            String            @id @default(cuid())
+  modelId       String
+  expressId     Int
+  source        PropertySource
+  psetName      String
+  propertyName  String
+  valueType     PropertyValueType
+  valueText     String
+  numericValue  Decimal?          @db.Decimal(18, 6)
+  booleanValue  Boolean?
+  rawValueJson  Json?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  model         IfcModel          @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, expressId, source, psetName, propertyName], map: "uniq_model_prop")
+  @@index([modelId, expressId, source])
+  @@index([modelId, source])
+}
+
+model IfcAnnotation {
+  id         String   @id @default(cuid())
+  modelId    String
+  clientId   String
+  x          Decimal  @db.Decimal(18, 6)
+  y          Decimal  @db.Decimal(18, 6)
+  z          Decimal  @db.Decimal(18, 6)
+  text       String   @db.Text
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  model      IfcModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, clientId])
+  @@index([modelId])
+}

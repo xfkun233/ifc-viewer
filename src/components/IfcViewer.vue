@@ -46,15 +46,42 @@ import {
   Aim,
 } from '@element-plus/icons-vue'
 import {
+  type IfcLineageMetadata,
   type PendingPropertyWrite,
   type ParsedCustomProperty,
   type AnnotationPoint,
+  computeIfcSourceFingerprint,
   createUpdatedIfcBlob,
   downloadIfcBlob,
   hasCustomDataSection,
+  parseIfcLineageMetadata,
   parseCustomProperties,
   parseAnnotationsFromCustomSection,
 } from '@/utils/ifcExporter'
+import {
+  bootstrapModelOverlays,
+  completeModelSnapshotSync,
+  failModelSnapshotSync,
+  deleteModelAnnotation,
+  deleteModelCustomProperty,
+  fetchPersistedModelFile,
+  getModelOverlays,
+  listPersistedModels,
+  startModelSnapshotSync,
+  uploadIfcModel,
+  uploadModelSnapshotChunk,
+  upsertModelAnnotation,
+  upsertModelCustomProperty,
+} from '@/services/api'
+import { extractIfcSnapshotChunk, getAllIfcExpressIds } from '@/services/ifcSnapshot'
+import type {
+  AnnotationMutation,
+  CustomPropertyMutation,
+  IfcSnapshotElement,
+  PersistedAnnotation,
+  PersistedCustomProperty,
+  PersistedModelSummary,
+} from '@/types/persistence'
 
 // 初始化 ThatOpen UI
 BUI.Manager.init()
@@ -70,6 +97,10 @@ interface CustomProperty {
   type: 'string' | 'number' | 'boolean'
 }
 
+interface PersistedPendingProperty extends PendingPropertyWrite {
+  databaseId?: string
+}
+
 // 响应式状态
 const viewerContainer = ref<HTMLElement | null>(null)
 const spatialTreeContainer = ref<HTMLElement | null>(null)
@@ -81,6 +112,12 @@ const treeFilterText = ref('')
 const moveSpeed = ref(3)
 const turnSpeed = ref(1.5)
 const isWalking = ref(false)
+const persistedModels = ref<PersistedModelSummary[]>([])
+const activePersistedModelId = ref<string | null>(null)
+const activePersistedModelSummary = ref<PersistedModelSummary | null>(null)
+const isPersistingModel = ref(false)
+const isSyncingModelSnapshot = ref(false)
+const snapshotSyncProgress = ref('')
 
 // 自定义属性相关状态
 const showPropertyDialog = ref(false)
@@ -100,7 +137,7 @@ const editPropertyValue = ref('')
 const editPropertyType = ref<'string' | 'number' | 'boolean'>('string')
 
 // 待写入属性列表（使用新的数据结构）
-const pendingProperties = ref<PendingPropertyWrite[]>([])
+const pendingProperties = ref<PersistedPendingProperty[]>([])
 
 // 从IFC文件解析的自定义属性（只读，用于回显）
 const loadedCustomProperties = ref<ParsedCustomProperty[]>([])
@@ -148,6 +185,9 @@ const annotationMarkerMap = new Map<THREE.Mesh, AnnotationPoint>()
 
 // 保存原始 IFC 数据用于后续文本操作导出
 let currentIfcData: Uint8Array | null = null
+let currentIfcLineageMetadata: IfcLineageMetadata | null = null
+let snapshotSyncQueue: Promise<void> = Promise.resolve()
+let persistedModelsRefreshTimer: number | null = null
 
 // 初始化查看器
 async function initViewer() {
@@ -625,6 +665,245 @@ function mapValueTypeReverse(type: PendingPropertyWrite['valueType']): 'string' 
   }
 }
 
+function toCustomPropertyMutation(prop: PendingPropertyWrite, expressId?: number): CustomPropertyMutation {
+  const normalizedExpressId =
+    expressId ?? Number.parseInt(prop.elementId.replace('#', ''), 10)
+
+  return {
+    expressId: normalizedExpressId,
+    psetName: prop.psetName,
+    propertyName: prop.propertyName,
+    valueType: prop.valueType,
+    value: prop.value,
+  }
+}
+
+function toAnnotationMutation(annotation: AnnotationPoint): AnnotationMutation {
+  return {
+    clientId: annotation.id,
+    x: annotation.x,
+    y: annotation.y,
+    z: annotation.z,
+    text: annotation.text,
+  }
+}
+
+function applyPersistedCustomProperties(properties: PersistedCustomProperty[]) {
+  pendingProperties.value = properties.map((property) => ({
+    databaseId: property.id,
+    elementId: `#${property.expressId}`,
+    psetName: property.psetName,
+    propertyName: property.propertyName,
+    value: property.value,
+    valueType: property.valueType,
+  }))
+}
+
+function applyPersistedAnnotations(items: PersistedAnnotation[]) {
+  annotations.value = items.map((item) => ({
+    id: item.id,
+    x: item.x,
+    y: item.y,
+    z: item.z,
+    text: item.text,
+  }))
+}
+
+async function refreshPersistedModels() {
+  try {
+    persistedModels.value = await listPersistedModels()
+    activePersistedModelSummary.value = activePersistedModelId.value
+      ? persistedModels.value.find((model) => model.id === activePersistedModelId.value) ?? activePersistedModelSummary.value
+      : null
+    snapshotSyncProgress.value = describePersistedModelSync(activePersistedModelSummary.value)
+  } catch (error) {
+    console.warn('获取持久化模型列表失败:', error)
+  }
+}
+
+function describePersistedModelSync(model: PersistedModelSummary | null | undefined) {
+  if (!model) {
+    return ''
+  }
+
+  if (model.syncStatus === 'READY') {
+    return `后端同步已完成，已保存 ${model.totalElements} 个构件 / ${model.totalProperties} 条属性`
+  }
+
+  if (model.syncStatus === 'FAILED') {
+    return '后端同步失败，可在同步队列页面重试'
+  }
+
+  if (model.syncStatus === 'PROCESSING') {
+    if (model.totalElements > 0) {
+      return `后端同步中 ${model.syncProcessedElements}/${model.totalElements} 个构件`
+    }
+
+    return '后端正在解析模型属性...'
+  }
+
+  return '模型已上传，等待后端同步队列处理'
+}
+
+async function buildCurrentIfcLineageMetadata(): Promise<IfcLineageMetadata | null> {
+  if (!currentIfcData) {
+    return null
+  }
+
+  const baseContentHash = await computeIfcSourceFingerprint(currentIfcData)
+  return {
+    schemaVersion: 1,
+    sourceFingerprint: activePersistedModelSummary.value?.sourceFingerprint
+      ?? currentIfcLineageMetadata?.sourceFingerprint
+      ?? baseContentHash,
+    baseContentHash,
+    importedFileHash: activePersistedModelSummary.value?.fileHash
+      ?? currentIfcLineageMetadata?.importedFileHash
+      ?? null,
+    exporter: 'ifc-viewer',
+    exportedAt: new Date().toISOString(),
+  }
+}
+
+function enqueueModelSnapshotSync(modelId: string, model: FragmentsModel) {
+  snapshotSyncQueue = snapshotSyncQueue
+    .catch(() => undefined)
+    .then(() => syncModelSnapshotToServer(modelId, model))
+
+  return snapshotSyncQueue
+}
+
+async function hydratePersistedOverlays(modelId: string) {
+  const overlays = await getModelOverlays(modelId)
+  applyPersistedCustomProperties(overlays.customProperties)
+  applyPersistedAnnotations(overlays.annotations)
+  loadAnnotationMarkers()
+}
+
+async function bootstrapPersistedOverlays(
+  modelId: string,
+  parsedProperties: ParsedCustomProperty[],
+  parsedAnnotations: AnnotationPoint[],
+) {
+  if (parsedProperties.length === 0 && parsedAnnotations.length === 0) {
+    await hydratePersistedOverlays(modelId)
+    return
+  }
+
+  const overlays = await bootstrapModelOverlays(modelId, {
+    customProperties: parsedProperties.map((property) => ({
+      expressId: Number.parseInt(property.elementId.replace('#', ''), 10),
+      psetName: property.psetName,
+      propertyName: property.propertyName,
+      valueType: property.valueType,
+      value: property.value,
+    })),
+    annotations: parsedAnnotations.map(toAnnotationMutation),
+  })
+
+  applyPersistedCustomProperties(overlays.customProperties)
+  applyPersistedAnnotations(overlays.annotations)
+  loadAnnotationMarkers()
+}
+
+const snapshotUploadChunkSize = 40
+const snapshotUploadMaxPayloadBytes = 4 * 1024 * 1024
+
+function estimateSnapshotPayloadBytes(elements: IfcSnapshotElement[]): number {
+  return new TextEncoder().encode(JSON.stringify({ chunkIndex: 0, elements })).length
+}
+
+function splitSnapshotElementsForUpload(elements: IfcSnapshotElement[]): IfcSnapshotElement[][] {
+  if (elements.length === 0) {
+    return []
+  }
+
+  const groups: IfcSnapshotElement[][] = []
+  let currentGroup: IfcSnapshotElement[] = []
+
+  for (const element of elements) {
+    const nextGroup = [...currentGroup, element]
+    if (currentGroup.length > 0 && estimateSnapshotPayloadBytes(nextGroup) > snapshotUploadMaxPayloadBytes) {
+      groups.push(currentGroup)
+      currentGroup = [element]
+      continue
+    }
+
+    currentGroup = nextGroup
+  }
+
+  if (currentGroup.length > 0) {
+    groups.push(currentGroup)
+  }
+
+  return groups
+}
+
+async function syncModelSnapshotToServer(modelId: string, model: FragmentsModel) {
+  isSyncingModelSnapshot.value = true
+  snapshotSyncProgress.value = '正在提取构件属性并同步到数据库...'
+
+  try {
+    const allExpressIds = await getAllIfcExpressIds(model)
+    const batchSize = snapshotUploadChunkSize
+    const totalChunks = Math.max(1, Math.ceil(allExpressIds.length / batchSize))
+    let totalProperties = 0
+    let processedElements = 0
+    let uploadedChunkIndex = 0
+
+    await startModelSnapshotSync(modelId, {
+      totalElements: allExpressIds.length,
+      totalChunks,
+    })
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const chunkIds = allExpressIds.slice(chunkIndex * batchSize, (chunkIndex + 1) * batchSize)
+      const elements = await extractIfcSnapshotChunk(model, chunkIds)
+      totalProperties += elements.reduce((sum, element) => sum + element.properties.length, 0)
+
+      const uploadGroups = splitSnapshotElementsForUpload(elements)
+      const uploadChunkIndexStart = uploadedChunkIndex
+      uploadedChunkIndex += uploadGroups.length
+
+      await Promise.all(
+        uploadGroups.map((uploadGroup, index) =>
+          uploadModelSnapshotChunk(modelId, {
+            chunkIndex: uploadChunkIndexStart + index,
+            elements: uploadGroup,
+          }),
+        ),
+      )
+
+      snapshotSyncProgress.value = `属性同步中 ${chunkIndex + 1}/${totalChunks}`
+      processedElements += chunkIds.length
+      snapshotSyncProgress.value = `属性同步中 ${processedElements}/${allExpressIds.length} 个构件`
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    await completeModelSnapshotSync(modelId, {
+      totalElements: allExpressIds.length,
+      totalProperties,
+    })
+
+    snapshotSyncProgress.value = '属性同步完成'
+    await refreshPersistedModels()
+    ElMessage.success('模型全部构件属性已同步到数据库')
+  } catch (error) {
+    console.error('同步模型属性失败:', error)
+    const reason = error instanceof Error ? error.message : 'Snapshot sync failed'
+    try {
+      await failModelSnapshotSync(modelId, { reason })
+      await refreshPersistedModels()
+    } catch (statusError) {
+      console.error('回写模型同步失败状态失败:', statusError)
+    }
+    snapshotSyncProgress.value = '属性同步失败'
+    ElMessage.error(`模型属性同步失败: ${reason}`)
+  } finally {
+    isSyncingModelSnapshot.value = false
+  }
+}
+
 
 
 // 获取某个构件的待写入属性
@@ -681,6 +960,7 @@ async function writePropertiesToIfc() {
   try {
     const currentPsetName = psetName.value.trim() || 'CustomProperties'
     const elementId = `#${selectedExpressId.value}`
+    const persistedModelId = activePersistedModelId.value
 
     let addedCount = 0
     let skippedCount = 0
@@ -696,14 +976,23 @@ async function writePropertiesToIfc() {
       if (exists) {
         skippedCount++
       } else {
-        // 添加新属性
-        pendingProperties.value.push({
+        const draftProperty: PersistedPendingProperty = {
           elementId,
           psetName: currentPsetName,
           propertyName: prop.name,
           value: prop.value,
-          valueType: mapValueType(prop.type)
-        })
+          valueType: mapValueType(prop.type),
+        }
+
+        if (persistedModelId) {
+          const savedProperty = await upsertModelCustomProperty(
+            persistedModelId,
+            toCustomPropertyMutation(draftProperty, selectedExpressId.value),
+          )
+          draftProperty.databaseId = savedProperty.id
+        }
+
+        pendingProperties.value.push(draftProperty)
         addedCount++
       }
     }
@@ -747,21 +1036,44 @@ async function refreshSelectedProperties() {
 }
 
 // 删除单个待写入属性
-function deletePendingProperty(index: number) {
+async function deletePendingProperty(property: PersistedPendingProperty) {
+  const index = pendingProperties.value.indexOf(property)
+  if (index === -1) return
+
+  const targetProperty = pendingProperties.value[index]
+  if (!targetProperty) return
+
+  if (activePersistedModelId.value && targetProperty.databaseId) {
+    await deleteModelCustomProperty(activePersistedModelId.value, targetProperty.databaseId)
+  }
+
   pendingProperties.value.splice(index, 1)
   ElMessage.success('属性已删除')
-  refreshSelectedProperties()
+  await refreshSelectedProperties()
 }
 
 // 清空所有待写入属性
-function clearAllPendingProperties() {
+async function clearAllPendingProperties() {
+  if (activePersistedModelId.value) {
+    const deletableIds = pendingProperties.value
+      .map((property) => property.databaseId)
+      .filter((id): id is string => Boolean(id))
+
+    await Promise.all(
+      deletableIds.map((propertyId) => deleteModelCustomProperty(activePersistedModelId.value!, propertyId)),
+    )
+  }
+
   pendingProperties.value = []
   ElMessage.success('已清空所有待写入属性')
-  refreshSelectedProperties()
+  await refreshSelectedProperties()
 }
 
 // 开始编辑属性
-function startEditProperty(prop: PendingPropertyWrite, index: number) {
+function startEditProperty(prop: PersistedPendingProperty) {
+  const index = pendingProperties.value.indexOf(prop)
+  if (index === -1) return
+
   editingProperty.value = { index, psetIndex: 0 }
   editPropertyName.value = prop.propertyName
   editPropertyValue.value = String(prop.value)
@@ -769,7 +1081,7 @@ function startEditProperty(prop: PendingPropertyWrite, index: number) {
 }
 
 // 保存编辑的属性
-function saveEditProperty() {
+async function saveEditProperty() {
   if (!editingProperty.value) return
 
   const { index } = editingProperty.value
@@ -793,14 +1105,30 @@ function saveEditProperty() {
     value = editPropertyValue.value.toLowerCase() === 'true'
   }
 
+  const previousDatabaseId = prop.databaseId
+  const previousPropertyName = prop.propertyName
+
   // 更新属性
   prop.propertyName = editPropertyName.value.trim()
   prop.value = value
   prop.valueType = mapValueType(editPropertyType.value)
 
+  if (activePersistedModelId.value) {
+    if (previousDatabaseId && previousPropertyName !== prop.propertyName) {
+      await deleteModelCustomProperty(activePersistedModelId.value, previousDatabaseId)
+      prop.databaseId = undefined
+    }
+
+    const savedProperty = await upsertModelCustomProperty(
+      activePersistedModelId.value,
+      toCustomPropertyMutation(prop),
+    )
+    prop.databaseId = savedProperty.id
+  }
+
   editingProperty.value = null
   ElMessage.success('属性已更新')
-  refreshSelectedProperties()
+  await refreshSelectedProperties()
 }
 
 // ==================== 内联编辑功能（右侧面板直接编辑） ====================
@@ -830,7 +1158,7 @@ function startInlineEdit(key: string, currentValue: string | number) {
 }
 
 // 保存内联编辑
-function saveInlineEdit(key: string) {
+async function saveInlineEdit(key: string) {
   if (!selectedExpressId.value) return
 
   const parsed = parseEditableKey(key)
@@ -869,6 +1197,14 @@ function saveInlineEdit(key: string) {
   // 更新属性值
   prop.value = newValue
 
+  if (activePersistedModelId.value) {
+    const savedProperty = await upsertModelCustomProperty(
+      activePersistedModelId.value,
+      toCustomPropertyMutation(prop, selectedExpressId.value),
+    )
+    prop.databaseId = savedProperty.id
+  }
+
   // 退出编辑模式
   inlineEditingKey.value = null
 
@@ -884,7 +1220,7 @@ function cancelInlineEdit() {
 }
 
 // 删除自定义属性（从右侧面板）
-function deleteCustomProperty(key: string) {
+async function deleteCustomProperty(key: string) {
   if (!selectedExpressId.value) return
 
   const parsed = parseEditableKey(key)
@@ -900,9 +1236,13 @@ function deleteCustomProperty(key: string) {
   )
 
   if (propIndex !== -1) {
+    const property = pendingProperties.value[propIndex]
+    if (activePersistedModelId.value && property?.databaseId) {
+      await deleteModelCustomProperty(activePersistedModelId.value, property.databaseId)
+    }
     pendingProperties.value.splice(propIndex, 1)
     ElMessage.success('属性已删除')
-    refreshSelectedProperties()
+    await refreshSelectedProperties()
   }
 }
 
@@ -924,8 +1264,15 @@ async function exportModifiedIfc() {
     isLoading.value = true
     ElMessage.info('正在导出 IFC 文件...')
 
+    const lineageMetadata = await buildCurrentIfcLineageMetadata()
+
     // 使用新的导出器创建 Blob（包含标注数据）
-    const blob = await createUpdatedIfcBlob(currentIfcData, pendingProperties.value, annotations.value)
+    const blob = await createUpdatedIfcBlob(
+      currentIfcData,
+      pendingProperties.value,
+      annotations.value,
+      lineageMetadata,
+    )
 
     // 下载文件
     const filename = (pendingProperties.value.length > 0 || annotations.value.length > 0)
@@ -1002,7 +1349,42 @@ const hasExistingCustomData = computed(() => {
 
 // 加载 IFC 文件
 let isLoadingLock = false
-async function loadIfcFile(file: File) {
+interface LoadIfcOptions {
+  persistedModelId?: string
+  persistedModelSummary?: PersistedModelSummary | null
+  skipServerUpload?: boolean
+  skipSnapshotSync?: boolean
+}
+
+async function loadPersistedModel(model: PersistedModelSummary) {
+  try {
+    isPersistingModel.value = true
+    const blob = await fetchPersistedModelFile(model.id)
+    const file = new File([blob], model.originalFileName, { type: model.mimeType })
+
+    await loadIfcFile(file, {
+      persistedModelId: model.id,
+      persistedModelSummary: model,
+      skipServerUpload: true,
+      skipSnapshotSync: model.syncStatus === 'READY',
+    })
+  } catch (error) {
+    console.error('加载服务端模型失败:', error)
+    ElMessage.error('加载已保存模型失败')
+  } finally {
+    isPersistingModel.value = false
+  }
+}
+
+async function loadLatestPersistedModel() {
+  await refreshPersistedModels()
+  const latestModel = persistedModels.value[0]
+  if (latestModel) {
+    await loadPersistedModel(latestModel)
+  }
+}
+
+async function loadIfcFile(file: File, options: LoadIfcOptions = {}) {
   if (!ifcLoader || !world || !fragmentsManager) return
 
   // 防止重复加载
@@ -1015,6 +1397,30 @@ async function loadIfcFile(file: File) {
   ElMessage.info('正在加载模型...')
 
   try {
+    let persistedModelId = options.persistedModelId ?? activePersistedModelId.value
+    let persistedModelSummary = options.persistedModelSummary ?? activePersistedModelSummary.value
+
+    if (!options.skipServerUpload) {
+      isPersistingModel.value = true
+      const persistedModel = await uploadIfcModel(file)
+      persistedModelId = persistedModel.id
+      persistedModelSummary = persistedModel
+      activePersistedModelId.value = persistedModel.id
+      activePersistedModelSummary.value = persistedModel
+      snapshotSyncProgress.value = describePersistedModelSync(persistedModel)
+      await refreshPersistedModels()
+    } else if (persistedModelId) {
+      activePersistedModelId.value = persistedModelId
+      activePersistedModelSummary.value = persistedModelSummary
+        ?? persistedModels.value.find((model) => model.id === persistedModelId)
+        ?? null
+      snapshotSyncProgress.value = describePersistedModelSync(activePersistedModelSummary.value)
+    } else {
+      activePersistedModelId.value = null
+      activePersistedModelSummary.value = null
+      snapshotSyncProgress.value = ''
+    }
+
     const arrayBuffer = await file.arrayBuffer()
     const uint8Array = new Uint8Array(arrayBuffer)
 
@@ -1028,6 +1434,7 @@ async function loadIfcFile(file: File) {
     ifcLoader.cleanUp()
     pendingProperties.value = []
     loadedCustomProperties.value = []
+    currentIfcLineageMetadata = null
 
     // 清理旧的标注
     clearAnnotationMarkers()
@@ -1041,6 +1448,7 @@ async function loadIfcFile(file: File) {
 
     // 保存原始 IFC 数据（用于后续文本操作导出）
     currentIfcData = uint8Array.slice() // 创建副本
+    currentIfcLineageMetadata = parseIfcLineageMetadata(currentIfcData)
 
     // 解析文件中已有的自定义属性
     const existingProps = parseCustomProperties(currentIfcData)
@@ -1082,11 +1490,16 @@ async function loadIfcFile(file: File) {
 
     hasModel.value = true
 
+    if (persistedModelId) {
+      await bootstrapPersistedOverlays(persistedModelId, existingProps, existingAnnotations)
+      snapshotSyncProgress.value = describePersistedModelSync(activePersistedModelSummary.value)
+    }
+
     // 显示加载结果
     const annoCount = annotations.value.length
-    if (existingProps.length > 0 || annoCount > 0) {
+    if (pendingProperties.value.length > 0 || annoCount > 0) {
       const parts: string[] = []
-      if (existingProps.length > 0) parts.push(`${existingProps.length} 个自定义属性`)
+      if (pendingProperties.value.length > 0) parts.push(`${pendingProperties.value.length} 个自定义属性`)
       if (annoCount > 0) parts.push(`${annoCount} 个标注点`)
       ElMessage.success(`模型加载成功！已读取 ${parts.join('、')}`)
     } else {
@@ -1094,8 +1507,9 @@ async function loadIfcFile(file: File) {
     }
   } catch (error) {
     console.error('加载模型失败:', error)
-    ElMessage.error('加载模型失败，请检查文件格式')
+    ElMessage.error(`加载模型失败: ${(error as Error).message}`)
   } finally {
+    isPersistingModel.value = false
     isLoading.value = false
     isLoadingLock = false
   }
@@ -1302,7 +1716,7 @@ function handleAnnotationClick(event: MouseEvent) {
   showAnnotationPopup.value = false
 }
 
-function confirmAnnotation() {
+async function confirmAnnotation() {
   if (!pendingAnnotationPosition.value || !annotationText.value.trim()) return
 
   const pos = pendingAnnotationPosition.value
@@ -1312,6 +1726,10 @@ function confirmAnnotation() {
     y: pos.y,
     z: pos.z,
     text: annotationText.value.trim()
+  }
+
+  if (activePersistedModelId.value) {
+    await upsertModelAnnotation(activePersistedModelId.value, toAnnotationMutation(annotation))
   }
 
   annotations.value.push(annotation)
@@ -1377,10 +1795,14 @@ function clearAnnotationMarkers() {
   }
 }
 
-function deleteAnnotation(id: string) {
+async function deleteAnnotation(id: string) {
   const idx = annotations.value.findIndex(a => a.id === id)
   if (idx !== -1) {
     annotations.value.splice(idx, 1)
+  }
+
+  if (activePersistedModelId.value) {
+    await deleteModelAnnotation(activePersistedModelId.value, id)
   }
 
   if (annotationGroup) {
@@ -1564,7 +1986,7 @@ interface UploadFile {
 
 function handleUploadChange(uploadFile: UploadFile) {
   if (uploadFile.raw) {
-    loadIfcFile(uploadFile.raw)
+    void loadIfcFile(uploadFile.raw)
   }
   return false
 }
@@ -1576,7 +1998,7 @@ function handleDrop(event: DragEvent) {
   if (files && files.length > 0) {
     const file = files[0]
     if (file && file.name.toLowerCase().endsWith('.ifc')) {
-      loadIfcFile(file)
+      void loadIfcFile(file)
     } else {
       ElMessage.warning('请上传 .ifc 格式的文件')
     }
@@ -1589,10 +2011,24 @@ function handleDragOver(event: DragEvent) {
 
 // 生命周期
 onMounted(() => {
-  initViewer()
+  void (async () => {
+    await initViewer()
+    await loadLatestPersistedModel()
+  })()
+
+  persistedModelsRefreshTimer = window.setInterval(() => {
+    if (activePersistedModelId.value || persistedModels.value.length > 0) {
+      void refreshPersistedModels()
+    }
+  }, 3000)
 })
 
 onUnmounted(() => {
+  if (persistedModelsRefreshTimer !== null) {
+    window.clearInterval(persistedModelsRefreshTimer)
+    persistedModelsRefreshTimer = null
+  }
+
   window.removeEventListener('resize', handleResize)
   window.removeEventListener('keydown', handleKeyDown)
   window.removeEventListener('keyup', handleKeyUp)
@@ -1647,6 +2083,44 @@ onUnmounted(() => {
             <p class="upload-hint">或点击上传</p>
           </div>
         </ElUpload>
+      </div>
+
+      <div class="persistence-section">
+        <div class="persistence-card">
+          <div class="persistence-title">后端持久化</div>
+          <p class="persistence-text">
+            {{ activePersistedModelId ? '当前模型已绑定后端存储' : '上传 IFC 后将自动持久化到后端和数据库' }}
+          </p>
+          <p v-if="activePersistedModelSummary" class="persistence-text">
+            源文件指纹: {{ activePersistedModelSummary.sourceFingerprint.slice(0, 16) }}...
+          </p>
+          <p v-if="isPersistingModel" class="persistence-status">正在上传模型到后端...</p>
+          <p v-else-if="snapshotSyncProgress" class="persistence-status">{{ snapshotSyncProgress }}</p>
+          <RouterLink class="persistence-link" to="/sync-queue">查看同步队列与进度</RouterLink>
+          <p v-if="activePersistedModelSummary?.syncError" class="persistence-error">
+            最近同步失败: {{ activePersistedModelSummary.syncError }}
+          </p>
+        </div>
+
+        <div v-if="persistedModels.length > 0" class="recent-models">
+          <div class="recent-models-header">
+            <h4>最近模型</h4>
+            <span>{{ persistedModels.length }}</span>
+          </div>
+          <div class="recent-model-list">
+            <ElButton
+              v-for="model in persistedModels.slice(0, 5)"
+              :key="model.id"
+              size="small"
+              class="recent-model-item"
+              :type="activePersistedModelId === model.id ? 'primary' : 'default'"
+              :disabled="isLoading || isPersistingModel"
+              @click="loadPersistedModel(model)"
+            >
+              {{ model.originalFileName }}
+            </ElButton>
+          </div>
+        </div>
       </div>
 
       <ElDivider />
@@ -1997,8 +2471,8 @@ onUnmounted(() => {
             <ElTableColumn prop="elementId" label="构件 ID" width="100" />
             <ElTableColumn prop="psetName" label="属性集" width="140" />
             <ElTableColumn label="属性名" min-width="120">
-              <template #default="{ row, $index }">
-                <template v-if="editingProperty?.index === $index">
+              <template #default="{ row }">
+                <template v-if="editingProperty?.index === pendingProperties.indexOf(row)">
                   <ElInput v-model="editPropertyName" size="small" />
                 </template>
                 <template v-else>
@@ -2007,8 +2481,8 @@ onUnmounted(() => {
               </template>
             </ElTableColumn>
             <ElTableColumn label="类型" width="80">
-              <template #default="{ row, $index }">
-                <template v-if="editingProperty?.index === $index">
+              <template #default="{ row }">
+                <template v-if="editingProperty?.index === pendingProperties.indexOf(row)">
                   <ElSelect v-model="editPropertyType" size="small" style="width: 70px">
                     <ElOption label="文本" value="string" />
                     <ElOption label="数字" value="number" />
@@ -2022,8 +2496,8 @@ onUnmounted(() => {
               </template>
             </ElTableColumn>
             <ElTableColumn label="值" min-width="120">
-              <template #default="{ row, $index }">
-                <template v-if="editingProperty?.index === $index">
+              <template #default="{ row }">
+                <template v-if="editingProperty?.index === pendingProperties.indexOf(row)">
                   <ElInput v-model="editPropertyValue" size="small" />
                 </template>
                 <template v-else>
@@ -2032,14 +2506,14 @@ onUnmounted(() => {
               </template>
             </ElTableColumn>
             <ElTableColumn label="操作" width="120" fixed="right">
-              <template #default="{ row, $index }">
-                <template v-if="editingProperty?.index === $index">
+              <template #default="{ row }">
+                <template v-if="editingProperty?.index === pendingProperties.indexOf(row)">
                   <ElButton type="success" size="small" link @click="saveEditProperty">保存</ElButton>
                   <ElButton type="info" size="small" link @click="cancelEditProperty">取消</ElButton>
                 </template>
                 <template v-else>
-                  <ElButton type="primary" :icon="Edit" size="small" link @click="startEditProperty(row, $index)" />
-                  <ElPopconfirm title="确定删除此属性？" @confirm="deletePendingProperty($index)">
+                  <ElButton type="primary" :icon="Edit" size="small" link @click="startEditProperty(row)" />
+                  <ElPopconfirm title="确定删除此属性？" @confirm="deletePendingProperty(row)">
                     <template #reference>
                       <ElButton type="danger" :icon="Delete" size="small" link />
                     </template>
@@ -2171,6 +2645,86 @@ onUnmounted(() => {
 .upload-hint {
   font-size: 12px !important;
   color: #909399 !important;
+}
+
+.persistence-section {
+  padding: 0 16px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.persistence-card,
+.recent-models {
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fafcff;
+}
+
+.persistence-title,
+.recent-models-header h4 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.persistence-text,
+.persistence-status {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #606266;
+}
+
+.persistence-status {
+  color: #409eff;
+}
+
+.persistence-link {
+  display: inline-flex;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #0f766e;
+  text-decoration: none;
+}
+
+.persistence-link:hover {
+  text-decoration: underline;
+}
+
+.persistence-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #f56c6c;
+}
+
+.recent-models-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.recent-models-header span {
+  font-size: 12px;
+  color: #909399;
+}
+
+.recent-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.recent-model-item {
+  justify-content: flex-start;
+  margin: 0;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .model-tree-section {

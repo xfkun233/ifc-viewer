@@ -19,4 +19,12 @@ export default defineConfig({
     exclude: ['web-ifc'],
   },
   assetsInclude: ['**/*.wasm'],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
+    },
+  },
 })

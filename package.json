@@ -8,7 +8,11 @@
   },
   "scripts": {
     "dev": "vite",
+    "dev:client": "vite",
+    "dev:api": "npm run dev --prefix apps/api",
+    "dev:full": "run-p dev:api dev:client",
     "build": "run-p type-check \"build-only {@}\" --",
+    "build:api": "npm run build --prefix apps/api",
     "preview": "vite preview",
     "build-only": "vite build",
     "type-check": "vue-tsc --build",

@@ -9,6 +9,8 @@
 
 export const MARKER_START = '/* === CUSTOM_DATA_START === */';
 export const MARKER_END = '/* === CUSTOM_DATA_END === */';
+export const METADATA_MARKER_START = '/* IFC_VIEWER_METADATA_JSON_START */';
+export const METADATA_MARKER_END = '/* IFC_VIEWER_METADATA_JSON_END */';
 
 // Performance: Only scan last 5MB for markers
 const MARKER_SCAN_LIMIT = 5 * 1024 * 1024;
@@ -32,6 +34,15 @@ export interface PendingPropertyWrite {
   value: string | number | boolean;
   /** Value type: STRING, REAL, INTEGER, BOOLEAN, LABEL */
   valueType: 'STRING' | 'REAL' | 'INTEGER' | 'BOOLEAN' | 'LABEL';
+}
+
+export interface IfcLineageMetadata {
+  schemaVersion: number;
+  sourceFingerprint: string;
+  baseContentHash: string;
+  importedFileHash?: string | null;
+  exporter?: string;
+  exportedAt?: string;
 }
 
 // ============================================================================
@@ -94,6 +105,35 @@ export function findEndSecPosition(data: Uint8Array): number {
   }
 
   return lastFound;
+}
+
+export function getIfcBaseData(data: Uint8Array): Uint8Array {
+  const markerIndex = findMarkerIndex(data, MARKER_START);
+  if (markerIndex !== -1) {
+    return data.slice(0, markerIndex);
+  }
+
+  const endSecPos = findEndSecPosition(data);
+  if (endSecPos === -1) {
+    return data.slice();
+  }
+
+  return data.slice(0, endSecPos);
+}
+
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export async function sha256Hex(data: Uint8Array): Promise<string> {
+  const copy = new Uint8Array(data.byteLength)
+  copy.set(data)
+  const digest = await crypto.subtle.digest('SHA-256', copy.buffer)
+  return toHex(new Uint8Array(digest));
+}
+
+export async function computeIfcSourceFingerprint(data: Uint8Array): Promise<string> {
+  return sha256Hex(getIfcBaseData(data));
 }
 
 /**
@@ -224,32 +264,22 @@ function formatIfcValue(
 export async function createUpdatedIfcBlob(
   originalData: Uint8Array,
   allProperties: PendingPropertyWrite[],
-  annotations?: AnnotationPoint[]
+  annotations?: AnnotationPoint[],
+  lineageMetadata?: IfcLineageMetadata | null
 ): Promise<Blob> {
   // =========================================================================
   // Step 1: Find Split Point
   // =========================================================================
   const markerIndex = findMarkerIndex(originalData, MARKER_START);
+  const endSecPos = findEndSecPosition(originalData);
+  const baseData = getIfcBaseData(originalData);
 
-  let baseData: Uint8Array;
-
-  // =========================================================================
-  // Step 2: Determine Base Data
-  // =========================================================================
   if (markerIndex !== -1) {
-    // Marker FOUND: Overwrite existing custom data
-    baseData = originalData.slice(0, markerIndex);
     console.log(`[IFC Export] Marker found at byte ${markerIndex}, overwriting existing custom data`);
-  } else {
-    // Marker NOT FOUND: First time writing
-    const endSecPos = findEndSecPosition(originalData);
-
-    if (endSecPos === -1) {
-      throw new Error('Invalid IFC file: Could not find ENDSEC; marker');
-    }
-
-    baseData = originalData.slice(0, endSecPos);
+  } else if (endSecPos !== -1) {
     console.log(`[IFC Export] No marker found, first-time write at byte ${endSecPos}`);
+  } else {
+    throw new Error('Invalid IFC file: Could not find ENDSEC; marker');
   }
 
   // =========================================================================
@@ -273,6 +303,11 @@ export async function createUpdatedIfcBlob(
   const timestamp = new Date().toISOString();
   lines.push(`/* Generated: ${timestamp} */`);
   lines.push(`/* Properties count: ${allProperties.length} */`);
+  if (lineageMetadata) {
+    lines.push(METADATA_MARKER_START);
+    lines.push(`/* ${JSON.stringify(lineageMetadata)} */`);
+    lines.push(METADATA_MARKER_END);
+  }
   lines.push('');
 
   // Group properties by element and pset for efficient generation
@@ -415,6 +450,48 @@ export function extractCustomDataSection(data: Uint8Array): string | null {
   );
 
   return new TextDecoder().decode(sectionBytes);
+}
+
+export function parseIfcLineageMetadata(data: Uint8Array): IfcLineageMetadata | null {
+  const customSection = extractCustomDataSection(data);
+  if (!customSection) {
+    return null;
+  }
+
+  const startIndex = customSection.indexOf(METADATA_MARKER_START);
+  const endIndex = customSection.indexOf(METADATA_MARKER_END);
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+    return null;
+  }
+
+  const jsonPayload = customSection
+    .slice(startIndex + METADATA_MARKER_START.length, endIndex)
+    .trim()
+    .replace(/^\/\*\s*/, '')
+    .replace(/\s*\*\/$/, '')
+    .trim();
+
+  try {
+    const parsed = JSON.parse(jsonPayload) as Partial<IfcLineageMetadata>;
+    if (
+      typeof parsed.schemaVersion === 'number' &&
+      typeof parsed.sourceFingerprint === 'string' &&
+      typeof parsed.baseContentHash === 'string'
+    ) {
+      return {
+        schemaVersion: parsed.schemaVersion,
+        sourceFingerprint: parsed.sourceFingerprint,
+        baseContentHash: parsed.baseContentHash,
+        importedFileHash: parsed.importedFileHash ?? null,
+        exporter: parsed.exporter,
+        exportedAt: parsed.exportedAt,
+      };
+    }
+  } catch (error) {
+    console.error('[IFC Parser] Failed to parse lineage metadata:', error);
+  }
+
+  return null;
 }
 
 /**

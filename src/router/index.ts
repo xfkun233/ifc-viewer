@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import IfcViewer from '@/components/IfcViewer.vue'
+import SyncQueuePage from '@/components/SyncQueuePage.vue'
 import FbxSimpleViewer from '@/components/FbxSimpleViewer.vue'
 import FbxFullViewerPage from '@/components/FbxFullViewerPage.vue'
 import FbxGeoRefPage from '@/components/FbxGeoRefPage.vue'
@@ -12,6 +13,11 @@ const router = createRouter({
       path: '/',
       name: 'IfcViewer',
       component: IfcViewer,
+    },
+    {
+      path: '/sync-queue',
+      name: 'SyncQueuePage',
+      component: SyncQueuePage,
     },
     {
       path: '/fbx',

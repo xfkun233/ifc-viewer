@@ -31,6 +31,11 @@ coverage
 
 .eslintcache
 
+apps/api/.env
+apps/api/dist
+apps/api/storage/uploads/*
+!apps/api/storage/uploads/.gitkeep
+
 # Cypress
 /cypress/videos/
 /cypress/screenshots/
