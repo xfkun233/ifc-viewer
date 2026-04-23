@@ -27,7 +27,7 @@
    - `fileHash`：本次上传文件的完整 SHA-256
    - `sourceFingerprint`：去掉自定义持久化区后的 IFC 基础内容指纹
 3. 如果上传的 IFC 已包含导出时写入的溯源元数据，后端会校验其中的 `sourceFingerprint` 是否与当前文件基础内容一致。
-4. 校验通过后保存原始 IFC 文件，并由前端触发 ThatOpen 全量快照同步。
+4. 校验通过后保存原始 IFC 文件，后端会将模型加入同步队列并由后台 Worker 自动执行全量快照解析与入库。
 
 ### 导出
 
@@ -143,12 +143,18 @@ npm run build
 
 ## 核心接口
 
+- `GET /api/models`：获取最近上传模型列表
+- `GET /api/sync-queue`：获取后端同步队列视图
 - `POST /api/models/upload`：上传 IFC，并完成哈希校验与入库
+- `GET /api/models/:modelId`：获取单个模型详情
+- `POST /api/models/:modelId/requeue-sync`：将模型重新加入后端同步队列
+- `GET /api/models/:modelId/file`：下载模型原始 IFC 文件
 - `POST /api/models/:modelId/snapshot/start`：开始一次全量构件快照同步
 - `POST /api/models/:modelId/snapshot/chunk`：分批写入构件原始数据与属性
 - `POST /api/models/:modelId/snapshot/complete`：完成快照同步
 - `POST /api/models/:modelId/snapshot/fail`：标记快照同步失败
 - `GET /api/models/:modelId/overlays`：读取自定义属性和标注
+- `POST /api/models/:modelId/overlays/bootstrap`：批量初始化/覆盖模型覆盖层（自定义属性与标注）
 - `PUT /api/models/:modelId/custom-properties`：新增或更新单个自定义属性
 - `DELETE /api/models/:modelId/custom-properties/:propertyId`：删除自定义属性
 - `PUT /api/models/:modelId/annotations`：新增或更新标注
@@ -158,4 +164,5 @@ npm run build
 
 - Vite 已配置 `/api` 代理到 `http://localhost:3001`。
 - 后端 `.env.example` 默认使用 `3307` 端口连接 Docker MySQL。
-- 模型重新加载时，如果数据库中的原生快照状态不是 `READY`，前端会自动重新触发同步。
+- 模型上传后会由后端自动加入同步队列，解析与入库由后端 Worker 异步执行。
+- 同步失败后可在同步队列页面手动重试（`requeue-sync`）。
