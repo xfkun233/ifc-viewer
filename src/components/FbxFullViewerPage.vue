@@ -57,9 +57,14 @@
     </div>
 
     <!-- ═══ 主体区域 ═══ -->
-    <div class="main-body">
+    <div class="main-body" :class="{ resizing: isResizingPanel }">
       <!-- 左侧导航面板 -->
-      <aside v-if="modelLoaded" class="panel panel-left" :class="{ collapsed: !showLeftPanel }">
+      <aside
+        v-if="modelLoaded"
+        class="panel panel-left"
+        :class="{ collapsed: !showLeftPanel }"
+        :style="showLeftPanel ? { width: `${leftPanelWidth}px` } : undefined"
+      >
         <div class="panel-tabs">
           <button
             class="panel-tab"
@@ -75,7 +80,7 @@
           >🧊</button>
         </div>
 
-        <div v-if="showLeftPanel" class="panel-body">
+        <div v-if="showLeftPanel" ref="treeScrollerEl" class="panel-body">
           <!-- 文件列表 -->
           <template v-if="leftTab === 'files'">
             <div class="panel-section-title">文件</div>
@@ -85,27 +90,47 @@
           <!-- 网格树 -->
           <template v-if="leftTab === 'meshes'">
             <div class="panel-section-title mesh-header">
-              <span>网格 ({{ meshNodes.length }})</span>
-              <div class="mesh-view-switch">
+              <span>Meshes</span>
+              <div class="mesh-actions">
                 <button
-                  class="mini-btn"
+                  class="mesh-icon-btn"
                   :class="{ active: meshViewMode === 'flat' }"
-                  @click="meshViewMode = 'flat'"
-                >平级</button>
+                  title="平级列表"
+                  @click="setMeshViewMode('flat')"
+                >☰</button>
                 <button
-                  class="mini-btn"
+                  class="mesh-icon-btn"
                   :class="{ active: meshViewMode === 'tree' }"
-                  @click="meshViewMode = 'tree'"
-                >树状</button>
+                  title="树状视图"
+                  @click="setMeshViewMode('tree')"
+                >▤</button>
+                <span class="mesh-action-sep"></span>
+                <button
+                  class="mesh-icon-btn expand-collapse-btn"
+                  :disabled="meshViewMode !== 'tree'"
+                  title="全部展开"
+                  @click="expandAllTreeGroups"
+                >
+                  <span class="expand-collapse-icon expand-all-icon"></span>
+                </button>
+                <button
+                  class="mesh-icon-btn expand-collapse-btn"
+                  :disabled="meshViewMode !== 'tree'"
+                  title="全部折叠"
+                  @click="collapseAllTreeGroups"
+                >
+                  <span class="expand-collapse-icon collapse-all-icon"></span>
+                </button>
               </div>
             </div>
 
             <template v-if="meshViewMode === 'flat'">
               <div
                 v-for="node in meshNodes"
-                :key="node.id"
+                :key="node.key"
                 class="tree-item"
-                :class="{ selected: selectedMeshId === node.id }"
+                :class="{ selected: selectedMeshKey === node.key, hidden: !node.visible }"
+                :data-mesh-key="node.key"
                 @click="selectMesh(node)"
               >
                 <button
@@ -113,6 +138,7 @@
                   :title="node.visible ? '隐藏' : '显示'"
                   @click.stop="toggleMeshVis(node)"
                 >{{ node.visible ? '👁' : '🚫' }}</button>
+                <button class="fit-btn" title="适应窗口" @click.stop="fitMeshToWindow(node.key)">⊞</button>
                 <span class="node-name">{{ node.name || `Mesh ${node.id}` }}</span>
               </div>
             </template>
@@ -123,22 +149,30 @@
                 :key="row.key"
                 class="tree-item"
                 :class="{
-                  selected: row.type === 'mesh' && selectedMeshId === row.meshId,
-                  'tree-group': row.type === 'group',
+                  selected: row.type === 'mesh' && selectedMeshKey === row.meshKey,
+                  'tree-group': row.type === 'node',
+                  hidden: !row.visible,
                 }"
-                :style="{ paddingLeft: `${12 + row.level * 14}px` }"
-                @click="row.type === 'group' ? toggleTreeGroup(row.groupKey) : row.meshId !== null && selectMeshById(row.meshId)"
+                :data-mesh-key="row.meshKey"
+                :style="{ paddingLeft: `${18 + row.level * 22}px` }"
+                @click="row.type === 'node' ? toggleTreeGroup(row.key) : row.meshKey !== null && selectMeshByKey(row.meshKey)"
               >
-                <template v-if="row.type === 'mesh' && row.meshId !== null">
+                <template v-if="row.type === 'mesh' && row.meshKey !== null">
                   <button
                     class="vis-btn"
-                    :title="isMeshVisible(row.meshId) ? '隐藏' : '显示'"
-                    @click.stop="toggleMeshVisById(row.meshId)"
-                  >{{ isMeshVisible(row.meshId) ? '👁' : '🚫' }}</button>
+                    :title="isMeshVisible(row.meshKey) ? '隐藏' : '显示'"
+                    @click.stop="toggleMeshVisByKey(row.meshKey)"
+                  >{{ isMeshVisible(row.meshKey) ? '👁' : '🚫' }}</button>
+                  <button class="fit-btn" title="适应窗口" @click.stop="fitMeshToWindow(row.meshKey)">⊞</button>
                   <span class="node-name">{{ row.name }}</span>
                 </template>
                 <template v-else>
-                  <span class="tree-branch">{{ isTreeGroupExpanded(row.groupKey) ? '▾' : '▸' }}</span>
+                  <span class="tree-branch">{{ row.hasChildren ? (isTreeGroupExpanded(row.key) ? '▾' : '▸') : '' }}</span>
+                  <button
+                    class="vis-btn"
+                    :title="row.visible ? '隐藏' : '显示'"
+                    @click.stop="row.nodeKey && toggleNodeVisByKey(row.nodeKey)"
+                  >{{ row.visible ? '👁' : '🚫' }}</button>
                   <span class="node-name">{{ row.name }}</span>
                 </template>
               </div>
@@ -151,11 +185,30 @@
         </button>
       </aside>
 
+      <div
+        v-if="modelLoaded && showLeftPanel"
+        class="panel-resizer panel-resizer-left"
+        title="拖动调整左侧面板宽度"
+        @pointerdown="startPanelResize('left', $event)"
+      ></div>
+
       <!-- 3D 视口 -->
       <div ref="viewerEl" class="viewport"></div>
 
+      <div
+        v-if="modelLoaded && showRightPanel"
+        class="panel-resizer panel-resizer-right"
+        title="拖动调整右侧面板宽度"
+        @pointerdown="startPanelResize('right', $event)"
+      ></div>
+
       <!-- 右侧详情面板 -->
-      <aside v-if="modelLoaded" class="panel panel-right" :class="{ collapsed: !showRightPanel }">
+      <aside
+        v-if="modelLoaded"
+        class="panel panel-right"
+        :class="{ collapsed: !showRightPanel }"
+        :style="showRightPanel ? { width: `${rightPanelWidth}px` } : undefined"
+      >
         <button class="panel-toggle right-toggle" @click="showRightPanel = !showRightPanel">
           {{ showRightPanel ? '▶' : '◀' }}
         </button>
@@ -181,26 +234,22 @@
             <div class="panel-section-title">Details</div>
             <table class="detail-table">
               <tbody>
-                <tr><td>Vertices</td><td class="val">{{ formatNum(details.vertices) }}</td></tr>
-                <tr><td>Triangles</td><td class="val">{{ formatNum(details.triangles) }}</td></tr>
-                <tr v-if="details.meshes > 0"><td>Meshes</td><td class="val">{{ formatNum(details.meshes) }}</td></tr>
-                <tr><td>Size X</td><td class="val">{{ details.sizeX }}</td></tr>
-                <tr><td>Size Y</td><td class="val">{{ details.sizeY }}</td></tr>
-                <tr><td>Size Z</td><td class="val">{{ details.sizeZ }}</td></tr>
-                <tr>
-                  <td>Volume</td>
-                  <td class="val">
-                    <span v-if="details.volume !== null">{{ details.volume }}</span>
-                    <a v-else class="calc-link" @click="calcVolume">Calculate…</a>
-                  </td>
-                </tr>
-                <tr>
-                  <td>Surface</td>
-                  <td class="val">
-                    <span v-if="details.surface !== null">{{ details.surface }}</span>
-                    <a v-else class="calc-link" @click="calcSurface">Calculate…</a>
-                  </td>
-                </tr>
+                <template v-for="group in detailGroups" :key="group.name">
+                  <tr v-if="group.name" class="detail-group-row">
+                    <td colspan="2">{{ group.name }}</td>
+                  </tr>
+                  <tr v-for="row in group.rows" :key="`${group.name}-${row.name}`">
+                    <td>{{ row.name }}</td>
+                    <td class="val">
+                      <a
+                        v-if="row.kind === 'calculated'"
+                        class="calc-link"
+                        @click="row.calculate?.()"
+                      >{{ row.value }}</a>
+                      <span v-else>{{ row.value }}</span>
+                    </td>
+                  </tr>
+                </template>
               </tbody>
             </table>
           </template>
@@ -276,7 +325,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import * as OV from 'online-3d-viewer'
 
 // ─── 环境贴图 ───
@@ -308,36 +357,78 @@ const currentBg = ref('#f3f4f6')
 // 面板状态
 const showLeftPanel = ref(true)
 const showRightPanel = ref(true)
+const leftPanelWidth = ref(390)
+const rightPanelWidth = ref(300)
+const isResizingPanel = ref(false)
 const leftTab = ref<'files' | 'meshes'>('meshes')
 const rightTab = ref<'details' | 'settings'>('details')
+const hasHierarchicalMeshTree = ref(false)
 
 // 网格树
 interface MeshNode {
-  id: number
+  key: string
+  id: InstanceId
   name: string
+  nodeId: number
+  meshIndex: number
   visible: boolean
+  parentNodeKeys: string[]
 }
 
 interface MeshTreeRow {
   key: string
   name: string
   level: number
-  type: 'group' | 'mesh'
-  meshId: number | null
-  groupKey: string
-  parentGroupKeys: string[]
+  type: 'node' | 'mesh'
+  meshKey: string | null
+  nodeId: number | null
+  nodeKey: string | null
+  parentNodeKeys: string[]
+  visible: boolean
+  hasChildren: boolean
+}
+
+interface DetailRow {
+  name: string
+  value: string
+  kind?: 'normal' | 'calculated'
+  calculate?: () => void
+}
+
+interface DetailGroup {
+  name: string
+  rows: DetailRow[]
+}
+
+type InstanceId = OV.MeshInstanceId
+type ModelObject = {
+  VertexCount?: () => number
+  LineSegmentCount?: () => number
+  TriangleCount?: () => number
+  PropertyGroupCount?: () => number
+  GetPropertyGroup?: (index: number) => {
+    name: string
+    PropertyCount: () => number
+    GetProperty: (index: number) => unknown
+  }
 }
 
 const meshNodes = ref<MeshNode[]>([])
 const meshTreeRows = ref<MeshTreeRow[]>([])
-const selectedMeshId = ref<number | null>(null)
+const selectedMeshKey = ref<string | null>(null)
 const meshViewMode = ref<'flat' | 'tree'>('tree')
 const expandedTreeGroups = ref<Set<string>>(new Set())
+const treeScrollerEl = ref<HTMLElement | null>(null)
+
+const meshNodeByKey = new Map<string, MeshNode>()
+const nodeMeshKeysByNodeKey = new Map<string, string[]>()
+const nodeRowsByKey = new Map<string, MeshTreeRow>()
+const highlightColor = new OV.RGBColor(142, 201, 240)
 
 const meshVisibilityMap = computed(() => {
-  const map = new Map<number, boolean>()
+  const map = new Map<string, boolean>()
   for (const node of meshNodes.value) {
-    map.set(node.id, node.visible)
+    map.set(node.key, node.visible)
   }
   return map
 })
@@ -345,29 +436,231 @@ const meshVisibilityMap = computed(() => {
 const visibleMeshTreeRows = computed(() => {
   const expanded = expandedTreeGroups.value
   return meshTreeRows.value.filter((row) => {
-    if (row.parentGroupKeys.length === 0) return true
-    return row.parentGroupKeys.every((groupKey) => expanded.has(groupKey))
+    if (row.parentNodeKeys.length === 0) return true
+    return row.parentNodeKeys.every((groupKey) => expanded.has(groupKey))
   })
 })
 
 // 详情面板
-const details = reactive({
-  vertices: 0,
-  triangles: 0,
-  meshes: 0,
-  sizeX: '0',
-  sizeY: '0',
-  sizeZ: '0',
-  volume: null as string | null,
-  surface: null as string | null,
-})
+const detailGroups = ref<DetailGroup[]>([])
 
 let embeddedViewer: OV.EmbeddedViewer | null = null
 let resizeObserver: ResizeObserver | null = null
 
-// ─── 格式化数字 ───
-const formatNum = (n: number) => n.toLocaleString()
-const formatDim = (n: number) => n.toFixed(2).replace(/\.?0+$/, '')
+// ─── 格式化与模型辅助 ───
+const getModel = () => embeddedViewer?.GetModel() as (OV.Model & Record<string, unknown>) | null
+
+const getInternalViewer = (): OV.Viewer | null => (embeddedViewer?.GetViewer() as OV.Viewer) ?? null
+
+const getNameOrDefault = (name: string | null | undefined, fallback = 'No Name') => {
+  const normalized = (name ?? '').trim()
+  return normalized.length > 0 ? normalized : fallback
+}
+
+const getMeshDisplayName = (nodeName: string, meshName: string) => {
+  return getNameOrDefault(nodeName.length > 0 ? nodeName : meshName)
+}
+
+const unitToString = (unit: number) => {
+  switch (unit) {
+    case OV.Unit.Millimeter:
+      return 'Millimeter'
+    case OV.Unit.Centimeter:
+      return 'Centimeter'
+    case OV.Unit.Meter:
+      return 'Meter'
+    case OV.Unit.Inch:
+      return 'Inch'
+    case OV.Unit.Foot:
+      return 'Foot'
+    default:
+      return 'Unknown'
+  }
+}
+
+const propertyToDisplayString = (property: unknown) => {
+  const prop = property as { type?: number; value?: unknown }
+  if (prop.type === OV.PropertyType.Color) {
+    const color = prop.value as OV.RGBColor
+    return `#${OV.RGBColorToHexString(color)}`
+  }
+  const value = OV.PropertyToString(property)
+  return value === null || value === undefined ? '-' : String(value)
+}
+
+const getBoxSize = (object3D: ModelObject) => {
+  const box = OV.GetBoundingBox(object3D)
+  return {
+    x: Math.abs((box.max?.x ?? 0) - (box.min?.x ?? 0)),
+    y: Math.abs((box.max?.y ?? 0) - (box.min?.y ?? 0)),
+    z: Math.abs((box.max?.z ?? 0) - (box.min?.z ?? 0)),
+  }
+}
+
+const getMeshKeyFromUserData = (userData: unknown): string | null => {
+  if (!userData || typeof userData !== 'object') return null
+  const id = (userData as { originalMeshInstance?: { id?: InstanceId } }).originalMeshInstance?.id
+  return id?.GetKey?.() ?? null
+}
+
+const isMeshKeyVisible = (meshKey: string | null) => {
+  if (meshKey === null) return false
+  return meshVisibilityMap.value.get(meshKey) ?? true
+}
+
+const isUserDataVisible = (userData: unknown) => {
+  const meshKey = getMeshKeyFromUserData(userData)
+  return isMeshKeyVisible(meshKey)
+}
+
+const createCalculatedRow = (name: string, calculateValue: () => OV.Property | null): DetailRow => {
+  const row: DetailRow = {
+    name,
+    value: 'Calculate...',
+    kind: 'calculated',
+    calculate: () => {
+      row.value = 'Please wait...'
+      row.kind = 'normal'
+      OV.RunTaskAsync(() => {
+        const result = calculateValue()
+        row.value = result === null ? '-' : propertyToDisplayString(result)
+      })
+    },
+  }
+  return row
+}
+
+const showObjectDetails = (object3D: ModelObject | null) => {
+  if (object3D === null) {
+    detailGroups.value = []
+    return
+  }
+
+  const model = getModel()
+  const size = getBoxSize(object3D)
+  const baseRows: DetailRow[] = [
+    { name: 'Vertices', value: (object3D.VertexCount?.() ?? 0).toLocaleString() },
+  ]
+
+  const lineSegmentCount = object3D.LineSegmentCount?.() ?? 0
+  if (lineSegmentCount > 0) {
+    baseRows.push({ name: 'Lines', value: lineSegmentCount.toLocaleString() })
+  }
+
+  const triangleCount = object3D.TriangleCount?.() ?? 0
+  if (triangleCount > 0) {
+    baseRows.push({ name: 'Triangles', value: triangleCount.toLocaleString() })
+  }
+
+  const unit = model?.GetUnit?.() ?? OV.Unit.Unknown
+  if (unit !== OV.Unit.Unknown) {
+    baseRows.push({ name: 'Unit', value: unitToString(unit) })
+  }
+
+  baseRows.push(
+    { name: 'Size X', value: propertyToDisplayString(new OV.Property(OV.PropertyType.Number, null, size.x)) },
+    { name: 'Size Y', value: propertyToDisplayString(new OV.Property(OV.PropertyType.Number, null, size.y)) },
+    { name: 'Size Z', value: propertyToDisplayString(new OV.Property(OV.PropertyType.Number, null, size.z)) },
+    createCalculatedRow('Volume', () => {
+      if (!OV.IsTwoManifold(object3D)) return null
+      return new OV.Property(OV.PropertyType.Number, null, OV.CalculateVolume(object3D))
+    }),
+    createCalculatedRow('Surface', () => {
+      return new OV.Property(OV.PropertyType.Number, null, OV.CalculateSurfaceArea(object3D))
+    }),
+  )
+
+  const groups: DetailGroup[] = [{ name: '', rows: baseRows }]
+  const propertyGroupCount = object3D.PropertyGroupCount?.() ?? 0
+  for (let groupIndex = 0; groupIndex < propertyGroupCount; groupIndex++) {
+    const propertyGroup = object3D.GetPropertyGroup?.(groupIndex)
+    if (!propertyGroup) continue
+    const rows: DetailRow[] = []
+    for (let propertyIndex = 0; propertyIndex < propertyGroup.PropertyCount(); propertyIndex++) {
+      const property = propertyGroup.GetProperty(propertyIndex) as { name?: string }
+      rows.push({
+        name: property.name ?? '',
+        value: propertyToDisplayString(property),
+      })
+    }
+    groups.push({
+      name: propertyGroup.name,
+      rows,
+    })
+  }
+
+  detailGroups.value = groups
+}
+
+const updateMeshesSelection = () => {
+  const viewer = getInternalViewer()
+  if (!viewer) return
+  const activeKey = selectedMeshKey.value
+  viewer.SetMeshesHighlight?.(highlightColor, (userData: unknown) => {
+    return activeKey !== null && getMeshKeyFromUserData(userData) === activeKey
+  })
+}
+
+const clearSelection = () => {
+  selectedMeshKey.value = null
+  updateMeshesSelection()
+  showObjectDetails(getModel())
+}
+
+const expandParentsForMesh = (meshKey: string) => {
+  const node = meshNodeByKey.get(meshKey)
+  if (!node) return
+  const next = new Set(expandedTreeGroups.value)
+  for (const parentNodeKey of node.parentNodeKeys) {
+    next.add(parentNodeKey)
+  }
+  expandedTreeGroups.value = next
+}
+
+const scrollMeshIntoView = (meshKey: string) => {
+  void nextTick(() => {
+    const scroller = treeScrollerEl.value
+    if (!scroller) return
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>('[data-mesh-key]'))
+    const row = rows.find((item) => item.dataset.meshKey === meshKey)
+    row?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  })
+}
+
+const selectMeshByKey = (meshKey: string, scrollToTree = false) => {
+  const node = meshNodeByKey.get(meshKey)
+  if (!node) return
+
+  if (selectedMeshKey.value === meshKey) {
+    clearSelection()
+    return
+  }
+
+  selectedMeshKey.value = meshKey
+  leftTab.value = 'meshes'
+  rightTab.value = 'details'
+  expandParentsForMesh(meshKey)
+  updateMeshesSelection()
+
+  const meshInstance = getModel()?.GetMeshInstance?.(node.id) as ModelObject | null
+  showObjectDetails(meshInstance)
+  if (scrollToTree) scrollMeshIntoView(meshKey)
+}
+
+const configureViewerSelectionHandlers = () => {
+  const viewer = getInternalViewer()
+  if (!viewer) return
+  viewer.SetMouseClickHandler?.((button: number, mouseCoordinates: OV.Coord2D) => {
+    if (button !== 1) return
+    const meshUserData = viewer.GetMeshUserDataUnderMouse?.(OV.IntersectionMode.MeshAndLine, mouseCoordinates)
+    const meshKey = getMeshKeyFromUserData(meshUserData)
+    if (meshKey === null) {
+      clearSelection()
+      return
+    }
+    selectMeshByKey(meshKey, true)
+  })
+}
 
 // ─── Viewer 生命周期 ───
 const createViewer = () => {
@@ -386,16 +679,18 @@ const createViewer = () => {
     edgeSettings: new OV.EdgeSettings(false, new OV.RGBColor(0, 0, 0), 1),
     environmentSettings: new OV.EnvironmentSettings(envUrls, false),
     onModelLoaded: () => {
-      fitToWindowInternal(false)
       isLoading.value = false
       modelLoaded.value = true
       refreshModelInfo()
+      fitToWindowInternal(false)
     },
     onModelLoadFailed: () => {
       isLoading.value = false
       errorMsg.value = '模型加载失败，请检查文件是否完整或格式是否支持。'
     },
   })
+
+  configureViewerSelectionHandlers()
 }
 
 const destroyViewer = () => {
@@ -405,91 +700,154 @@ const destroyViewer = () => {
   }
 }
 
-const getInternalViewer = (): OV.Viewer | null => (embeddedViewer?.GetViewer() as OV.Viewer) ?? null
-
 // ─── 模型信息 ───
 const refreshModelInfo = () => {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const model = embeddedViewer?.GetModel() as Record<string, any> | null
+  const model = getModel()
   if (!model) return
 
-  details.vertices = model.VertexCount?.() ?? 0
-  details.triangles = model.TriangleCount?.() ?? 0
-  details.meshes = model.MeshInstanceCount?.() ?? 0
-  details.volume = null
-  details.surface = null
+  selectedMeshKey.value = null
+  meshNodeByKey.clear()
+  nodeMeshKeysByNodeKey.clear()
+  nodeRowsByKey.clear()
 
   // 平级网格列表 + 树状网格列表
   const nodes: MeshNode[] = []
   const treeRows: MeshTreeRow[] = []
   const root = model.GetRootNode?.()
   if (root) {
-    let idCounter = 0
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const walkNode = (node: any, level: number, parentGroupKeys: string[]) => {
-      const nodeName = node.GetName?.() || 'Node'
-      const childCount = node.ChildNodeCount?.() ?? 0
-      const meshCount = node.MeshIndexCount?.() ?? 0
-      const nodeId = node.GetId?.() ?? `${nodeName}-${level}`
-      const groupKey = `group-${nodeId}-${level}`
-      const nextParentGroupKeys = [...parentGroupKeys, groupKey]
-
-      treeRows.push({
-        key: groupKey,
-        name: nodeName,
-        level,
-        type: 'group',
-        meshId: null,
-        groupKey,
-        parentGroupKeys,
-      })
-
-      for (let i = 0; i < meshCount; i++) {
-        const meshName = meshCount > 1 ? `${nodeName} [${i + 1}]` : nodeName
-        const meshId = idCounter++
-        nodes.push({
-          id: meshId,
-          name: meshName,
-          visible: true,
-        })
-        treeRows.push({
-          key: `mesh-${meshId}`,
-          name: meshName,
-          level: level + 1,
-          type: 'mesh',
-          meshId,
-          groupKey: '',
-          parentGroupKeys: nextParentGroupKeys,
-        })
+    hasHierarchicalMeshTree.value = false
+    for (const childNode of root.GetChildNodes?.() ?? []) {
+      if ((childNode.ChildNodeCount?.() ?? 0) > 0 || (childNode.MeshIndexCount?.() ?? 0) > 1) {
+        hasHierarchicalMeshTree.value = true
+        break
       }
+    }
+    meshViewMode.value = hasHierarchicalMeshTree.value ? 'tree' : 'flat'
 
-      for (let i = 0; i < childCount; i++) {
-        const child = node.GetChildNode?.(i)
-        if (child) walkNode(child, level + 1, nextParentGroupKeys)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const collectMeshKeys = (node: any, result: string[]) => {
+      for (let i = 0; i < (node.MeshIndexCount?.() ?? 0); i++) {
+        const meshIndex = node.GetMeshIndex?.(i)
+        if (meshIndex === undefined) continue
+        result.push(new OV.MeshInstanceId(node.GetId(), meshIndex).GetKey())
+      }
+      for (const child of node.GetChildNodes?.() ?? []) {
+        collectMeshKeys(child, result)
       }
     }
 
-    walkNode(root, 0, [])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const addMeshRow = (node: any, level: number, parentNodeKeys: string[], meshIndex: number) => {
+      const nodeId = node.GetId?.()
+      const mesh = model.GetMesh?.(meshIndex)
+      const meshName = getMeshDisplayName(node.GetName?.() ?? '', mesh?.GetName?.() ?? '')
+      const meshId = new OV.MeshInstanceId(nodeId, meshIndex)
+      const meshKey = meshId.GetKey()
+      const meshNode: MeshNode = {
+        key: meshKey,
+        id: meshId,
+        name: meshName,
+        nodeId,
+        meshIndex,
+        visible: true,
+        parentNodeKeys,
+      }
+      nodes.push(meshNode)
+      meshNodeByKey.set(meshKey, meshNode)
+      treeRows.push({
+        key: `mesh-${meshKey}`,
+        name: meshName,
+        level,
+        type: 'mesh',
+        meshKey,
+        nodeId,
+        nodeKey: null,
+        parentNodeKeys,
+        visible: true,
+        hasChildren: false,
+      })
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const createNodeRow = (node: any, level: number, parentNodeKeys: string[]) => {
+      const nodeName = getNameOrDefault(node.GetName?.(), 'No Name')
+      const childCount = node.ChildNodeCount?.() ?? 0
+      const meshCount = node.MeshIndexCount?.() ?? 0
+      const nodeId = node.GetId?.()
+      const nodeKey = `node-${nodeId}`
+      const descendantMeshKeys: string[] = []
+      collectMeshKeys(node, descendantMeshKeys)
+      nodeMeshKeysByNodeKey.set(nodeKey, descendantMeshKeys)
+      const row: MeshTreeRow = {
+        key: nodeKey,
+        name: nodeName,
+        level,
+        type: 'node',
+        meshKey: null,
+        nodeId,
+        nodeKey,
+        parentNodeKeys,
+        visible: true,
+        hasChildren: childCount > 0 || meshCount > 0,
+      }
+      nodeRowsByKey.set(nodeKey, row)
+      treeRows.push(row)
+      return nodeKey
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const walkFlatNode = (node: any) => {
+      for (const child of node.GetChildNodes?.() ?? []) {
+        walkFlatNode(child)
+      }
+      for (const meshIndex of node.GetMeshIndices?.() ?? []) {
+        addMeshRow(node, 0, [], meshIndex)
+      }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const walkTreeNode = (node: any, parentNodeKeys: string[], level: number) => {
+      const childMeshNodes: unknown[] = []
+      for (const childNode of node.GetChildNodes?.() ?? []) {
+        if (childNode.IsMeshNode?.()) {
+          childMeshNodes.push(childNode)
+        } else {
+          const nodeKey = createNodeRow(childNode, level, parentNodeKeys)
+          walkTreeNode(childNode, [...parentNodeKeys, nodeKey], level + 1)
+        }
+      }
+
+      for (const meshNode of childMeshNodes) {
+        walkTreeNode(meshNode, parentNodeKeys, level)
+      }
+
+      for (const meshIndex of node.GetMeshIndices?.() ?? []) {
+        addMeshRow(node, level, parentNodeKeys, meshIndex)
+      }
+    }
+
+    if (hasHierarchicalMeshTree.value) {
+      for (const childNode of root.GetChildNodes?.() ?? []) {
+        if (childNode.IsMeshNode?.()) {
+          walkTreeNode(childNode, [], 0)
+        } else {
+          const nodeKey = createNodeRow(childNode, 0, [])
+          walkTreeNode(childNode, [nodeKey], 1)
+        }
+      }
+      for (const meshIndex of root.GetMeshIndices?.() ?? []) {
+        addMeshRow(root, 0, [], meshIndex)
+      }
+    } else {
+      walkFlatNode(root)
+    }
   }
   meshNodes.value = nodes
   meshTreeRows.value = treeRows
   expandedTreeGroups.value = new Set()
 
-  // 包围盒尺寸
-  const v = getInternalViewer()
-  if (v) {
-    const bbox = v.GetBoundingBox?.(() => true)
-    if (bbox) {
-      const size = { x: 0, y: 0, z: 0 }
-      try { bbox.getSize(size) } catch { /* ignore */ }
-      // THREE.Box3.getSize returns THREE.Vector3
-      if (size) {
-        details.sizeX = formatDim(Math.abs(size.x ?? 0))
-        details.sizeY = formatDim(Math.abs(size.y ?? 0))
-        details.sizeZ = formatDim(Math.abs(size.z ?? 0))
-      }
-    }
-  }
+  showObjectDetails(model)
+  updateMeshesSelection()
 }
 
 // ─── 文件加载 ───
@@ -499,6 +857,14 @@ const loadFiles = (files: FileList) => {
   errorMsg.value = ''
   isLoading.value = true
   modelLoaded.value = false
+  selectedMeshKey.value = null
+  detailGroups.value = []
+  meshNodes.value = []
+  meshTreeRows.value = []
+  meshNodeByKey.clear()
+  nodeMeshKeysByNodeKey.clear()
+  nodeRowsByKey.clear()
+  updateMeshesSelection()
 
   const names: string[] = []
   for (let i = 0; i < files.length; i++) names.push(files[i]!.name)
@@ -532,8 +898,10 @@ const onDrop = (e: DragEvent) => {
 const fitToWindowInternal = (animated = true) => {
   const v = getInternalViewer()
   if (!v) return
-  const sphere = v.GetBoundingSphere?.(() => true)
-  if (sphere) v.FitSphereToWindow(sphere, animated)
+  const sphere = v.GetBoundingSphere?.(isUserDataVisible)
+  if (!sphere) return
+  if (!animated) v.AdjustClippingPlanesToSphere?.(sphere)
+  v.FitSphereToWindow(sphere, animated)
 }
 
 const fitToWindow = () => {
@@ -591,39 +959,42 @@ const setBgColor = (hex: string) => {
 
 // ─── 网格操作 ───
 const selectMesh = (node: MeshNode) => {
-  selectedMeshId.value = node.id
+  selectMeshByKey(node.key)
 }
 
-const selectMeshById = (id: number) => {
-  selectedMeshId.value = id
-}
-
-const isMeshVisible = (meshId: number) => {
-  return meshVisibilityMap.value.get(meshId) ?? true
+const isMeshVisible = (meshKey: string) => {
+  return meshVisibilityMap.value.get(meshKey) ?? true
 }
 
 const applyMeshVisibility = () => {
   const v = getInternalViewer()
   if (!v) return
 
-  const visMap = new Set(meshNodes.value.filter((n) => n.visible).map((n) => n.id))
-  let idx = 0
-  v.SetMeshesVisibility?.((() => {
-    const isVis = visMap.has(idx)
-    idx++
-    return isVis
-  }) as unknown as (userData: unknown) => boolean)
+  v.SetMeshesVisibility?.((userData: unknown) => isUserDataVisible(userData))
+  fitToVisibleModelIfSelectionHidden()
 }
 
 const toggleMeshVis = (node: MeshNode) => {
   node.visible = !node.visible
+  updateNodeVisibilityFromMeshes()
   applyMeshVisibility()
 }
 
-const toggleMeshVisById = (meshId: number) => {
-  const node = meshNodes.value.find((n) => n.id === meshId)
+const toggleMeshVisByKey = (meshKey: string) => {
+  const node = meshNodeByKey.get(meshKey)
   if (!node) return
-  node.visible = !node.visible
+  toggleMeshVis(node)
+}
+
+const toggleNodeVisByKey = (nodeKey: string) => {
+  const meshKeys = nodeMeshKeysByNodeKey.get(nodeKey) ?? []
+  const row = nodeRowsByKey.get(nodeKey)
+  const nextVisible = !(row?.visible ?? true)
+  for (const meshKey of meshKeys) {
+    const meshNode = meshNodeByKey.get(meshKey)
+    if (meshNode) meshNode.visible = nextVisible
+  }
+  updateNodeVisibilityFromMeshes()
   applyMeshVisibility()
 }
 
@@ -640,23 +1011,82 @@ const toggleTreeGroup = (groupKey: string) => {
   expandedTreeGroups.value = next
 }
 
-// ─── 体积 / 面积计算 ───
-const calcVolume = () => {
-  const model = embeddedViewer?.GetModel()
-  if (!model) return
-  const vol = OV.CalculateVolume(model)
-  details.volume = vol != null ? formatDim(vol) : 'N/A'
+const setMeshViewMode = (mode: 'flat' | 'tree') => {
+  meshViewMode.value = mode
+  clearSelection()
 }
 
-const calcSurface = () => {
-  const model = embeddedViewer?.GetModel()
-  if (!model) return
-  const area = OV.CalculateSurfaceArea(model)
-  details.surface = area != null ? formatDim(area) : 'N/A'
+const expandAllTreeGroups = () => {
+  expandedTreeGroups.value = new Set(meshTreeRows.value.filter((row) => row.type === 'node').map((row) => row.key))
+}
+
+const collapseAllTreeGroups = () => {
+  expandedTreeGroups.value = new Set()
+}
+
+const updateNodeVisibilityFromMeshes = () => {
+  for (const row of meshTreeRows.value) {
+    if (row.type === 'mesh' && row.meshKey !== null) {
+      row.visible = meshNodeByKey.get(row.meshKey)?.visible ?? false
+    }
+  }
+  for (const [nodeKey, meshKeys] of nodeMeshKeysByNodeKey) {
+    const row = nodeRowsByKey.get(nodeKey)
+    if (!row) continue
+    row.visible = meshKeys.some((meshKey) => meshNodeByKey.get(meshKey)?.visible ?? false)
+  }
+  meshTreeRows.value = [...meshTreeRows.value]
+  meshNodes.value = [...meshNodes.value]
+}
+
+const fitToVisibleModelIfSelectionHidden = () => {
+  if (selectedMeshKey.value === null || isMeshKeyVisible(selectedMeshKey.value)) return
+  clearSelection()
+}
+
+const fitMeshToWindow = (meshKey: string) => {
+  const viewer = getInternalViewer()
+  if (!viewer) return
+  const sphere = viewer.GetBoundingSphere?.((userData: unknown) => getMeshKeyFromUserData(userData) === meshKey)
+  if (sphere) viewer.FitSphereToWindow(sphere, true)
 }
 
 // ─── 尺寸响应 ───
 const onResize = () => embeddedViewer?.Resize()
+
+const clampPanelWidth = (width: number) => Math.min(620, Math.max(220, width))
+
+const startPanelResize = (side: 'left' | 'right', event: PointerEvent) => {
+  event.preventDefault()
+  isResizingPanel.value = true
+  const startX = event.clientX
+  const startWidth = side === 'left' ? leftPanelWidth.value : rightPanelWidth.value
+  const target = event.currentTarget as HTMLElement | null
+  target?.setPointerCapture?.(event.pointerId)
+
+  const onPointerMove = (moveEvent: PointerEvent) => {
+    const delta = moveEvent.clientX - startX
+    const nextWidth = side === 'left' ? startWidth + delta : startWidth - delta
+    if (side === 'left') {
+      leftPanelWidth.value = clampPanelWidth(nextWidth)
+    } else {
+      rightPanelWidth.value = clampPanelWidth(nextWidth)
+    }
+    requestAnimationFrame(() => embeddedViewer?.Resize())
+  }
+
+  const stopResize = () => {
+    isResizingPanel.value = false
+    window.removeEventListener('pointermove', onPointerMove)
+    window.removeEventListener('pointerup', stopResize)
+    window.removeEventListener('pointercancel', stopResize)
+    embeddedViewer?.Resize()
+  }
+
+  window.addEventListener('pointermove', onPointerMove)
+  window.addEventListener('pointerup', stopResize, { once: true })
+  window.addEventListener('pointercancel', stopResize, { once: true })
+}
 
 // ─── 生命周期 ───
 onMounted(() => {
@@ -781,12 +1211,21 @@ onUnmounted(() => {
   position: relative;
 }
 
+.main-body.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.main-body.resizing .panel {
+  transition: none;
+}
+
 /* ═══════ 面板通用 ═══════ */
 .panel {
   display: flex;
   flex-direction: column;
   background: #fff;
-  width: 240px;
+  width: 300px;
   min-width: 0;
   transition: width 0.2s;
   flex-shrink: 0;
@@ -804,6 +1243,40 @@ onUnmounted(() => {
 
 .panel-right {
   border-left: 1px solid #e2e8f0;
+}
+
+.panel-resizer {
+  width: 6px;
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 4;
+}
+
+.panel-resizer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #e5e7eb;
+}
+
+.panel-resizer-left::before {
+  left: 0;
+}
+
+.panel-resizer-right::before {
+  right: 0;
+}
+
+.panel-resizer:hover {
+  background: rgba(37, 147, 209, 0.08);
+}
+
+.panel-resizer:hover::before {
+  background: #3393bd;
 }
 
 .panel-tabs {
@@ -839,46 +1312,115 @@ onUnmounted(() => {
 .panel-body {
   flex: 1;
   overflow-y: auto;
-  padding: 6px 0;
+  padding: 8px 12px;
 }
 
 .panel-section-title {
-  padding: 8px 12px 4px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: #64748b;
+  padding: 10px 0 12px;
+  border-bottom: 1px solid #e5e7eb;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: #111827;
 }
 
 .mesh-header {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
 }
 
-.mesh-view-switch {
+.mesh-actions {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
+  min-height: 32px;
 }
 
-.mini-btn {
-  border: 1px solid #cbd5e1;
-  background: #fff;
-  color: #475569;
-  border-radius: 4px;
-  font-size: 11px;
+.mesh-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: #425466;
+  border-radius: 3px;
+  font-size: 18px;
   line-height: 1;
-  padding: 3px 7px;
   cursor: pointer;
 }
 
-.mini-btn.active {
-  border-color: #93c5fd;
-  background: #dbeafe;
-  color: #1d4ed8;
+.mesh-icon-btn:hover:not(:disabled) {
+  background: #f1f5f9;
+}
+
+.mesh-icon-btn.active {
+  color: #3393bd;
+  background: #f3f4f6;
+}
+
+.mesh-icon-btn:disabled {
+  color: #cbd5e1;
+  cursor: default;
+}
+
+.expand-collapse-btn {
+  position: relative;
+}
+
+.expand-collapse-icon {
+  position: relative;
+  display: block;
+  width: 18px;
+  height: 18px;
+}
+
+.expand-collapse-icon::before,
+.expand-collapse-icon::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  width: 10px;
+  height: 10px;
+  border-color: currentColor;
+  border-style: solid;
+  transform: rotate(45deg);
+}
+
+.expand-all-icon::before,
+.expand-all-icon::after {
+  border-width: 0 2px 2px 0;
+}
+
+.expand-all-icon::before {
+  top: 1px;
+}
+
+.expand-all-icon::after {
+  top: 7px;
+}
+
+.collapse-all-icon::before,
+.collapse-all-icon::after {
+  border-width: 2px 0 0 2px;
+}
+
+.collapse-all-icon::before {
+  top: 4px;
+}
+
+.collapse-all-icon::after {
+  top: 10px;
+}
+
+.mesh-action-sep {
+  width: 1px;
+  height: 22px;
+  margin: 0 8px;
+  background: #e5e7eb;
 }
 
 .panel-toggle {
@@ -912,11 +1454,13 @@ onUnmounted(() => {
 .tree-item {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 12px;
+  gap: 8px;
+  min-height: 36px;
+  padding: 4px 8px;
   cursor: pointer;
   transition: background 0.1s;
-  font-size: 12px;
+  font-size: 18px;
+  line-height: 1.35;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -927,18 +1471,25 @@ onUnmounted(() => {
 }
 
 .tree-item.selected {
-  background: #dbeafe;
+  background: #eeeeee;
 }
 
 .tree-item.tree-group {
-  color: #475569;
-  font-weight: 600;
+  color: #333333;
+  font-weight: 400;
   cursor: default;
 }
 
+.tree-item.hidden {
+  color: #94a3b8;
+}
+
 .tree-branch {
-  width: 12px;
-  color: #64748b;
+  width: 18px;
+  color: #475569;
+  font-size: 20px;
+  line-height: 1;
+  text-align: center;
   flex-shrink: 0;
 }
 
@@ -946,37 +1497,73 @@ onUnmounted(() => {
   background: none;
   border: none;
   cursor: pointer;
-  font-size: 12px;
+  color: #7b8794;
+  font-size: 16px;
+  line-height: 1;
   padding: 0;
   flex-shrink: 0;
+}
+
+.vis-btn:hover {
+  color: #334155;
+}
+
+.fit-btn {
+  background: none;
+  border: none;
+  color: #64748b;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.fit-btn:hover {
+  color: #2563eb;
 }
 
 .node-name {
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
 
 /* ═══════ 详情表格 ═══════ */
 .detail-table {
   width: 100%;
   border-collapse: collapse;
-  padding: 0 12px;
+  margin-top: 12px;
+  font-size: 18px;
 }
 
 .detail-table td {
-  padding: 5px 12px;
-  border-bottom: 1px solid #f1f5f9;
+  padding: 6px 0;
+  border-bottom: none;
+  line-height: 1.4;
 }
 
 .detail-table .val {
   text-align: right;
   font-variant-numeric: tabular-nums;
-  color: #2563eb;
-  font-weight: 500;
+  color: #1f2937;
+  font-weight: 400;
+  padding-left: 28px;
+  white-space: nowrap;
+}
+
+.detail-group-row td {
+  padding-top: 18px;
+  color: #111827;
+  background: transparent;
+  font-size: 18px;
+  font-weight: 600;
+  text-align: left;
+  text-transform: none;
 }
 
 .calc-link {
-  color: #2563eb;
+  color: #3393bd;
   cursor: pointer;
   text-decoration: none;
 }
